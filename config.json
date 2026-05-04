@@ -1,0 +1,26 @@
+{
+  "report_date": "20 October 2025",
+  "quarter": "Q4",
+  "year": "2025",
+  "start_date": "22-Sep-2025",
+  "end_date": "25-Sep-2025",
+  "prepared_by": "Susanna Chitraresmi",
+  "acknowledged_by": "Sabar T. H. Siregar",
+  "approved_by": "Alvaro J. Duran S.",
+  "approved_title": "APRIL Fiber R&D Head",
+  "non_moving": [
+    {
+      "sloc": "4413",
+      "desc": "R&D Stores",
+      "count": 72,
+      "value": 283043745
+    },
+    {
+      "sloc": "4414",
+      "desc": "KTC Store",
+      "count": 92,
+      "value": 470126900
+    }
+  ],
+  "store_overrides": {}
+}
