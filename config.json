@@ -1,0 +1,48 @@
+{
+  "report_date": "20 October 2025",
+  "quarter": "Q1",
+  "year": "2026",
+  "start_date": "21-Apr-2026",
+  "end_date": "22-Apr-2026",
+  "prepared_by": "Susanna Chitraresmi",
+  "acknowledged_by": "Sabar T. H. Siregar",
+  "approved_by": "Alvaro J. Duran S.",
+  "approved_title": "APRIL Fiber R&D Head",
+  "non_moving": [
+    {
+      "sloc": "4413",
+      "desc": "R&D Stores",
+      "count": 72,
+      "value": 283043745
+    },
+    {
+      "sloc": "4414",
+      "desc": "KTC Store",
+      "count": 92,
+      "value": 470126900
+    }
+  ],
+  "store_overrides": {
+    "Plant Health Lab. Store": {
+      "stock_take_date": ""
+    },
+    "Analytical Lab. Store": {
+      "stock_take_date": ""
+    },
+    "Biomol Lab. Store": {
+      "stock_take_date": ""
+    },
+    "R&D Main Store": {
+      "stock_take_date": ""
+    },
+    "R&D Nursery Store": {
+      "stock_take_date": ""
+    },
+    "GD Seed Store": {
+      "stock_take_date": ""
+    },
+    "KTC Store": {
+      "stock_take_date": ""
+    }
+  }
+}
