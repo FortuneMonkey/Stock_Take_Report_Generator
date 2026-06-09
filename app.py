@@ -1,7 +1,8 @@
 import streamlit as st
 import openpyxl
-import io, os, json, re
-from datetime import datetime
+import pandas as pd
+import io, os, json, re, copy
+from datetime import datetime, date
 from docx import Document
 from docx.shared import Pt, RGBColor, Cm
 from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -687,6 +688,118 @@ def generate_pdf(cfg, stores_results):
     story.append(sig_tbl); doc.build(story); buf.seek(0); return buf
 
 # ══════════════════════════════════════════════════════════════════════════════
+# STOCK REPORT UPDATER
+# ══════════════════════════════════════════════════════════════════════════════
+
+def extract_section_from_ref(ref):
+    if not ref or str(ref).strip() in ('', 'nan'): return ''
+    ref = str(ref).strip()
+    if '/' in ref: return ref.split('/')[0].strip()
+    return ' '.join(ref.split()[:3])
+
+def prepare_transaction_df(uploaded_file):
+    df = pd.read_excel(uploaded_file, sheet_name=0)
+    if 'Section' not in df.columns:
+        ref_col = next((c for c in df.columns if 'reference' in str(c).lower()), None)
+        if ref_col: df['Section'] = df[ref_col].apply(extract_section_from_ref)
+    if 'Code' not in df.columns:
+        qty_col = next((c for c in df.columns if str(c).lower() == 'quantity'), None)
+        if qty_col: df['Code'] = df[qty_col].apply(lambda x: 'GI' if safe_float(x) < 0 else 'GR')
+    if 'Quantity(RemoveNegative)' not in df.columns:
+        qty_col = next((c for c in df.columns if str(c).lower() == 'quantity'), None)
+        if qty_col: df['Quantity(RemoveNegative)'] = df[qty_col].apply(lambda x: abs(safe_float(x)))
+    return df
+
+def generate_updated_stock_report(trans_df, stock_file):
+    from openpyxl.utils import get_column_letter
+    from datetime import datetime as dt
+    wb = openpyxl.load_workbook(stock_file)
+    ws = wb.active
+
+    today_dt = dt.combine(date.today(), dt.min.time())
+    max_col = ws.max_column
+    prev_bal_col = max_col          # last column = previous final balance (e.g. col 20 = T)
+    prev_start_col = max_col - 3   # start of previous 4-col group (e.g. col 17 = Q)
+    new_start = max_col + 1        # first column of new group (e.g. col 21 = U)
+
+    # ── Row 1: date header cell ──────────────────────────────────────────────
+    date_cell = ws.cell(row=1, column=new_start)
+    date_cell.value = today_dt
+    src = ws.cell(row=1, column=prev_start_col)
+    if src.has_style:
+        date_cell.font        = copy.copy(src.font)
+        date_cell.fill        = copy.copy(src.fill)
+        date_cell.alignment   = copy.copy(src.alignment)
+        date_cell.border      = copy.copy(src.border)
+        date_cell.number_format = src.number_format   # "d-mmm-yy"
+
+    # ── Row 2: sub-headers Balance / GR / GI / Balance ─────────────────────
+    for i, label in enumerate(['Balance', 'GR', 'GI', 'Balance']):
+        cell = ws.cell(row=2, column=new_start+i)
+        cell.value = label
+        src2 = ws.cell(row=2, column=prev_start_col+i)
+        if src2.has_style:
+            cell.font      = copy.copy(src2.font)
+            cell.fill      = copy.copy(src2.fill)
+            cell.alignment = copy.copy(src2.alignment)
+            cell.border    = copy.copy(src2.border)
+
+    # ── Column widths ────────────────────────────────────────────────────────
+    for i in range(4):
+        ws.column_dimensions[get_column_letter(new_start+i)].width = \
+            ws.column_dimensions[get_column_letter(prev_start_col+i)].width
+
+    # ── Build grouped lookup: (mat_str, sec_str, code) -> summed qty ─────────
+    trans_df['_mat']  = trans_df['Material'].astype(str).str.strip()
+    trans_df['_sec']  = trans_df['Section'].astype(str).str.strip()
+    trans_df['_code'] = trans_df['Code'].astype(str).str.strip()
+    trans_df['_qty']  = trans_df['Quantity(RemoveNegative)'].fillna(0)
+    grp = trans_df.groupby(['_mat','_sec','_code'])['_qty'].sum()
+
+    # Column letters for formulas
+    prev_bal_letter = get_column_letter(prev_bal_col)   # e.g. "T"
+    new_bal_letter  = get_column_letter(new_start)      # e.g. "U"
+    new_gr_letter   = get_column_letter(new_start+1)    # e.g. "V"
+    new_gi_letter   = get_column_letter(new_start+2)    # e.g. "W"
+    new_final_letter= get_column_letter(new_start+3)    # e.g. "X"
+
+    # ── Data rows ────────────────────────────────────────────────────────────
+    for row_idx in range(3, ws.max_row + 1):
+        mc_val  = ws.cell(row=row_idx, column=1).value
+        sec_val = ws.cell(row=row_idx, column=4).value
+        if mc_val is None: continue
+
+        mc_str  = str(mc_val).strip()
+        sec_str = str(sec_val).strip() if sec_val is not None else ''
+
+        gr = int(grp.get((mc_str, sec_str, 'GR'), 0))
+        gi = int(grp.get((mc_str, sec_str, 'GI'), 0))
+
+        # Col new_start   : =prev_bal_col (formula, same as existing pattern)
+        # Col new_start+1 : GR  (hardcoded int)
+        # Col new_start+2 : GI  (hardcoded int)
+        # Col new_start+3 : =new_bal + GR - GI (formula)
+        values_and_formulas = [
+            f"={prev_bal_letter}{row_idx}",   # Balance (carry forward)
+            gr,                                # GR
+            gi,                                # GI
+            f"={new_bal_letter}{row_idx}+{new_gr_letter}{row_idx}-{new_gi_letter}{row_idx}",  # new Balance
+        ]
+        for i, val in enumerate(values_and_formulas):
+            cell = ws.cell(row=row_idx, column=new_start+i)
+            cell.value = val
+            src3 = ws.cell(row=row_idx, column=prev_start_col+i)
+            if src3.has_style:
+                cell.font         = copy.copy(src3.font)
+                cell.fill         = copy.copy(src3.fill)
+                cell.alignment    = copy.copy(src3.alignment)
+                cell.border       = copy.copy(src3.border)
+                cell.number_format = src3.number_format
+
+    buf = io.BytesIO(); wb.save(buf); buf.seek(0)
+    return buf
+
+# ══════════════════════════════════════════════════════════════════════════════
 # UI
 # ══════════════════════════════════════════════════════════════════════════════
 if "stores_results" not in st.session_state: st.session_state.stores_results={}
@@ -698,7 +811,7 @@ cfg=load_config()
 if st.session_state.detected_q: cfg["quarter"]=st.session_state.detected_q
 if st.session_state.detected_y: cfg["year"]=st.session_state.detected_y
 
-tab_upload,tab_config,tab_generate=st.tabs(["📁 Upload Store Files","⚙️ Configuration","📄 Generate Report"])
+tab_upload,tab_config,tab_generate,tab_stock=st.tabs(["📁 Upload Store Files","⚙️ Configuration","📄 Generate Report","📊 Stock Report Updater"])
 
 with tab_upload:
     st.markdown("### Upload Store Excel Files")
@@ -914,3 +1027,55 @@ with tab_generate:
                 buf=generate_pdf(cfg,st.session_state.stores_results)
                 st.download_button(f"⬇️ Download {fname}.pdf",buf,file_name=f"{fname}.pdf",
                     mime="application/pdf",use_container_width=True)
+
+with tab_stock:
+    st.markdown("### 📊 Stock Report Updater")
+    st.caption("Upload the Transaction file and current Stock Report — the app adds a new date column group (today) with computed Balance, GR, GI, and updated Balance.")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        trans_file = st.file_uploader("📋 Transaction File (.xlsx)", type=["xlsx"], key="trans_upload",
+                                      help="SAP transaction export. Needs columns: Material, Reference, Quantity, Section (or derived from Reference).")
+        if trans_file:
+            st.markdown('<span style="color:#155724;font-weight:600">✅ Loaded</span>', unsafe_allow_html=True)
+    with c2:
+        stock_file = st.file_uploader("📦 Stock Report File (.xlsx)", type=["xlsx"], key="stock_upload",
+                                      help="Existing stock report with Balance/GR/GI/Balance columns per date period.")
+        if stock_file:
+            st.markdown('<span style="color:#155724;font-weight:600">✅ Loaded</span>', unsafe_allow_html=True)
+
+    if trans_file and stock_file:
+        with st.expander("👁️ Transaction Preview (first 10 rows)", expanded=False):
+            try:
+                trans_file.seek(0)
+                df_prev = pd.read_excel(trans_file, sheet_name=0)
+                if 'Section' not in df_prev.columns:
+                    ref_col = next((c for c in df_prev.columns if 'reference' in str(c).lower()), None)
+                    if ref_col: df_prev['Section'] = df_prev[ref_col].apply(extract_section_from_ref)
+                if 'Code' not in df_prev.columns:
+                    qty_col = next((c for c in df_prev.columns if str(c).lower() == 'quantity'), None)
+                    if qty_col: df_prev['Code'] = df_prev[qty_col].apply(lambda x: 'GI' if safe_float(x) < 0 else 'GR')
+                if 'Quantity(RemoveNegative)' not in df_prev.columns:
+                    qty_col = next((c for c in df_prev.columns if str(c).lower() == 'quantity'), None)
+                    if qty_col: df_prev['Quantity(RemoveNegative)'] = df_prev[qty_col].apply(lambda x: abs(safe_float(x)))
+                show = [c for c in ['Material','Material Description','Section','Code','Quantity','Quantity(RemoveNegative)','EUn'] if c in df_prev.columns]
+                st.dataframe(df_prev[show].head(10), use_container_width=True)
+                trans_file.seek(0)
+            except Exception as e:
+                st.error(f"Error reading transaction file: {e}")
+
+        today_label = date.today().strftime("%d-%b-%Y")
+        if st.button(f"🔄 Generate Updated Stock Report (add {today_label})", type="primary", use_container_width=True):
+            with st.spinner("Processing..."):
+                try:
+                    trans_file.seek(0); stock_file.seek(0)
+                    trans_df = prepare_transaction_df(trans_file)
+                    stock_file.seek(0)
+                    buf = generate_updated_stock_report(trans_df, stock_file)
+                    out_name = f"Stock_Report_Updated_{today_label}.xlsx"
+                    st.download_button(f"⬇️ Download {out_name}", buf, file_name=out_name,
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True)
+                    st.markdown('<div class="ok">✅ Stock Report updated — new date column added.</div>', unsafe_allow_html=True)
+                except Exception as e:
+                    st.error(f"❌ Error: {e}")
