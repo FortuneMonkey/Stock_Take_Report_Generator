@@ -1,7 +1,8 @@
 import streamlit as st
 import openpyxl
-import io, os, json, re
-from datetime import datetime
+import pandas as pd
+import io, os, json, re, copy
+from datetime import datetime, date
 from docx import Document
 from docx.shared import Pt, RGBColor, Cm
 from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -15,19 +16,53 @@ from reportlab.lib.units import cm
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 from reportlab.lib.enums import TA_RIGHT, TA_CENTER
 
-st.set_page_config(page_title="Stock Take Report Generator", page_icon="📦", layout="wide")
+st.set_page_config(page_title="APRIL R&D Admin Suite", page_icon="📦", layout="wide")
 st.markdown("""
 <style>
-.main-header{background:linear-gradient(90deg,#1F4E79,#2E75B6);color:white;padding:1.4rem 2rem;border-radius:10px;margin-bottom:1.2rem}
-.warn{background:#fff3cd;border:1px solid #ffeeba;padding:.7rem 1rem;border-radius:6px;color:#856404;margin-bottom:.8rem}
-.ok{background:#d4edda;border:1px solid #c3e6cb;padding:.7rem 1rem;border-radius:6px;color:#155724;margin-bottom:.5rem}
-.store-ok{color:#155724;font-weight:600}
-.store-err{color:#721c24;font-weight:600}
+/* ── Global ────────────────────────────────────────────── */
+[data-testid="stAppViewContainer"]  { background: #f5f7fa; }
+[data-testid="stMainBlockContainer"] { padding-top: 1.2rem; }
+
+/* ── Sidebar ───────────────────────────────────────────── */
+[data-testid="stSidebar"] {
+    background: #ffffff;
+    border-right: 1px solid #e8ecf0;
+}
+[data-testid="stSidebar"] > div:first-child { padding-bottom: 2rem; }
+
+/* Nav buttons — make them look like menu items */
+[data-testid="stSidebar"] .stButton > button {
+    text-align: left !important;
+    border-radius: 8px !important;
+    border: none !important;
+    font-size: .9rem !important;
+    padding: .55rem .9rem !important;
+    font-weight: 500 !important;
+    transition: background .15s !important;
+}
+[data-testid="stSidebar"] .stButton > button[kind="secondary"] {
+    background: transparent !important;
+    color: #4a5568 !important;
+}
+[data-testid="stSidebar"] .stButton > button[kind="secondary"]:hover {
+    background: #f0f5ff !important;
+    color: #1F4E79 !important;
+}
+[data-testid="stSidebar"] .stButton > button[kind="primary"] {
+    background: #e8f0fe !important;
+    color: #1F4E79 !important;
+    font-weight: 700 !important;
+    border-left: 3px solid #2E75B6 !important;
+    border-radius: 0 8px 8px 0 !important;
+}
+
+/* ── Tabs ──────────────────────────────────────────────── */
+[data-testid="stTabs"] [role="tab"] { font-weight: 600; font-size: .88rem; }
+
+/* ── Buttons ───────────────────────────────────────────── */
+.stButton > button[kind="primary"] { border-radius: 8px; font-weight: 600; }
 </style>
 """, unsafe_allow_html=True)
-st.markdown('<div class="main-header"><h2 style="margin:0">📦 Stock Take Report Generator</h2>'
-            '<p style="margin:0;opacity:.85">APRIL Fiber R&D — Quarterly Stock Take Automation</p></div>',
-            unsafe_allow_html=True)
 
 STORE_DEFS = [
     {"key":"SOL",  "name":"Analytical Lab. Store",  "default_pic":"Nanda Aprilinati", "sloc":"4413","seed":False},
@@ -687,230 +722,479 @@ def generate_pdf(cfg, stores_results):
     story.append(sig_tbl); doc.build(story); buf.seek(0); return buf
 
 # ══════════════════════════════════════════════════════════════════════════════
+# STOCK REPORT UPDATER
+# ══════════════════════════════════════════════════════════════════════════════
+
+def extract_section_from_ref(ref):
+    if not ref or str(ref).strip() in ('', 'nan'): return ''
+    ref = str(ref).strip()
+    if '/' in ref: return ref.split('/')[0].strip()
+    return ' '.join(ref.split()[:3])
+
+def prepare_transaction_df(uploaded_file):
+    df = pd.read_excel(uploaded_file, sheet_name=0)
+    if 'Section' not in df.columns:
+        ref_col = next((c for c in df.columns if 'reference' in str(c).lower()), None)
+        if ref_col: df['Section'] = df[ref_col].apply(extract_section_from_ref)
+    if 'Code' not in df.columns:
+        qty_col = next((c for c in df.columns if str(c).lower() == 'quantity'), None)
+        if qty_col: df['Code'] = df[qty_col].apply(lambda x: 'GI' if safe_float(x) < 0 else 'GR')
+    if 'Quantity(RemoveNegative)' not in df.columns:
+        qty_col = next((c for c in df.columns if str(c).lower() == 'quantity'), None)
+        if qty_col: df['Quantity(RemoveNegative)'] = df[qty_col].apply(lambda x: abs(safe_float(x)))
+    return df
+
+def generate_updated_stock_report(trans_df, stock_file):
+    from openpyxl.utils import get_column_letter
+    from datetime import datetime as dt
+    wb = openpyxl.load_workbook(stock_file)
+    ws = wb.active
+
+    today_dt = dt.combine(date.today(), dt.min.time())
+    max_col = ws.max_column
+    prev_bal_col = max_col          # last column = previous final balance (e.g. col 20 = T)
+    prev_start_col = max_col - 3   # start of previous 4-col group (e.g. col 17 = Q)
+    new_start = max_col + 1        # first column of new group (e.g. col 21 = U)
+
+    # ── Row 1: date header cell ──────────────────────────────────────────────
+    date_cell = ws.cell(row=1, column=new_start)
+    date_cell.value = today_dt
+    src = ws.cell(row=1, column=prev_start_col)
+    if src.has_style:
+        date_cell.font        = copy.copy(src.font)
+        date_cell.fill        = copy.copy(src.fill)
+        date_cell.alignment   = copy.copy(src.alignment)
+        date_cell.border      = copy.copy(src.border)
+        date_cell.number_format = src.number_format   # "d-mmm-yy"
+
+    # ── Row 2: sub-headers Balance / GR / GI / Balance ─────────────────────
+    for i, label in enumerate(['Balance', 'GR', 'GI', 'Balance']):
+        cell = ws.cell(row=2, column=new_start+i)
+        cell.value = label
+        src2 = ws.cell(row=2, column=prev_start_col+i)
+        if src2.has_style:
+            cell.font      = copy.copy(src2.font)
+            cell.fill      = copy.copy(src2.fill)
+            cell.alignment = copy.copy(src2.alignment)
+            cell.border    = copy.copy(src2.border)
+
+    # ── Column widths ────────────────────────────────────────────────────────
+    for i in range(4):
+        ws.column_dimensions[get_column_letter(new_start+i)].width = \
+            ws.column_dimensions[get_column_letter(prev_start_col+i)].width
+
+    # ── Build grouped lookup: (mat_str, sec_str, code) -> summed qty ─────────
+    trans_df['_mat']  = trans_df['Material'].astype(str).str.strip()
+    trans_df['_sec']  = trans_df['Section'].astype(str).str.strip()
+    trans_df['_code'] = trans_df['Code'].astype(str).str.strip()
+    trans_df['_qty']  = trans_df['Quantity(RemoveNegative)'].fillna(0)
+    grp = trans_df.groupby(['_mat','_sec','_code'])['_qty'].sum()
+
+    # Column letters for formulas
+    prev_bal_letter = get_column_letter(prev_bal_col)   # e.g. "T"
+    new_bal_letter  = get_column_letter(new_start)      # e.g. "U"
+    new_gr_letter   = get_column_letter(new_start+1)    # e.g. "V"
+    new_gi_letter   = get_column_letter(new_start+2)    # e.g. "W"
+    new_final_letter= get_column_letter(new_start+3)    # e.g. "X"
+
+    # ── Data rows ────────────────────────────────────────────────────────────
+    for row_idx in range(3, ws.max_row + 1):
+        mc_val  = ws.cell(row=row_idx, column=1).value
+        sec_val = ws.cell(row=row_idx, column=4).value
+        if mc_val is None: continue
+
+        mc_str  = str(mc_val).strip()
+        sec_str = str(sec_val).strip() if sec_val is not None else ''
+
+        gr = int(grp.get((mc_str, sec_str, 'GR'), 0))
+        gi = int(grp.get((mc_str, sec_str, 'GI'), 0))
+
+        # Col new_start   : =prev_bal_col (formula, same as existing pattern)
+        # Col new_start+1 : GR  (hardcoded int)
+        # Col new_start+2 : GI  (hardcoded int)
+        # Col new_start+3 : =new_bal + GR - GI (formula)
+        values_and_formulas = [
+            f"={prev_bal_letter}{row_idx}",   # Balance (carry forward)
+            gr,                                # GR
+            gi,                                # GI
+            f"={new_bal_letter}{row_idx}+{new_gr_letter}{row_idx}-{new_gi_letter}{row_idx}",  # new Balance
+        ]
+        for i, val in enumerate(values_and_formulas):
+            cell = ws.cell(row=row_idx, column=new_start+i)
+            cell.value = val
+            src3 = ws.cell(row=row_idx, column=prev_start_col+i)
+            if src3.has_style:
+                cell.font         = copy.copy(src3.font)
+                cell.fill         = copy.copy(src3.fill)
+                cell.alignment    = copy.copy(src3.alignment)
+                cell.border       = copy.copy(src3.border)
+                cell.number_format = src3.number_format
+
+    buf = io.BytesIO(); wb.save(buf); buf.seek(0)
+    return buf
+
+# ══════════════════════════════════════════════════════════════════════════════
 # UI
 # ══════════════════════════════════════════════════════════════════════════════
-if "stores_results" not in st.session_state: st.session_state.stores_results={}
-if "nm_results"     not in st.session_state: st.session_state.nm_results={}
-if "detected_q"     not in st.session_state: st.session_state.detected_q=None
-if "detected_y"     not in st.session_state: st.session_state.detected_y=None
+if "stores_results" not in st.session_state: st.session_state.stores_results = {}
+if "nm_results"     not in st.session_state: st.session_state.nm_results = {}
+if "detected_q"     not in st.session_state: st.session_state.detected_q = None
+if "detected_y"     not in st.session_state: st.session_state.detected_y = None
+if "page"           not in st.session_state: st.session_state.page = "stock_take"
 
-cfg=load_config()
-if st.session_state.detected_q: cfg["quarter"]=st.session_state.detected_q
-if st.session_state.detected_y: cfg["year"]=st.session_state.detected_y
+cfg = load_config()
+if st.session_state.detected_q: cfg["quarter"] = st.session_state.detected_q
+if st.session_state.detected_y: cfg["year"]    = st.session_state.detected_y
 
-tab_upload,tab_config,tab_generate=st.tabs(["📁 Upload Store Files","⚙️ Configuration","📄 Generate Report"])
+# ── Sidebar ───────────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.markdown(
+        "<div style='text-align:center;padding:1.4rem 0 .6rem'>"
+        "<span style='font-size:2.4rem'>📦</span><br>"
+        "<span style='font-weight:800;color:#1F4E79;font-size:1rem'>APRIL Fiber R&D</span><br>"
+        "<span style='font-size:.72rem;color:#888;letter-spacing:.06em;text-transform:uppercase'>"
+        "Admin Automation Suite</span></div>",
+        unsafe_allow_html=True,
+    )
+    st.divider()
 
-with tab_upload:
-    st.markdown("### Upload Store Excel Files")
-    st.markdown("""<div class="warn">Upload all 9 Excel files (7 store + 2 Non-Moving Stock). Each must have a sheet named <b>auto</b>.<br>
-Store: <code>PHL</code> · <code>SOL</code> · <code>BIO</code> · <code>RDS</code> · <code>KRN</code> · <code>SEED</code> · <code>TCL</code> &nbsp;|&nbsp;
-Non-Moving: filename must contain <code>Non Moving</code> + <code>4413</code> or <code>4414</code></div>""", unsafe_allow_html=True)
+    p = st.session_state.page
+    if st.button("📋  Stock Take Report",   use_container_width=True,
+                 type="primary" if p == "stock_take"    else "secondary", key="nav_st"):
+        st.session_state.page = "stock_take";    st.rerun()
+    if st.button("📊  Stock Report Updater", use_container_width=True,
+                 type="primary" if p == "stock_updater" else "secondary", key="nav_su"):
+        st.session_state.page = "stock_updater"; st.rerun()
 
-    uploaded_files=st.file_uploader("Upload Excel files",type=["xlsx","xls"],accept_multiple_files=True)
-    if uploaded_files:
-        for f in uploaded_files:
-            nm_def=detect_nm_file(f.name)
-            if nm_def:
-                data,err=parse_nm_file(f,nm_def)
+    st.divider()
+
+    total_loaded = len([s for s in STORE_DEFS if s["key"] in st.session_state.stores_results])
+    total_nm     = len([n for n in NM_DEFS    if n["sloc"] in st.session_state.nm_results])
+    ok_col, bad_col = "#198754", "#dc3545"
+    st.markdown(
+        f"<div style='font-size:.8rem;color:#444;line-height:2'>"
+        f"<b>Upload Status</b><br>"
+        f"Store files &nbsp;"
+        f"<b style='color:{ok_col if total_loaded==7 else bad_col}'>{total_loaded}/7</b><br>"
+        f"NM files &nbsp;&nbsp;&nbsp;&nbsp;"
+        f"<b style='color:{ok_col if total_nm==2 else bad_col}'>{total_nm}/2</b><br>"
+        f"Quarter &nbsp;<b>{cfg.get('quarter','—')}</b> &nbsp;·&nbsp; "
+        f"Year &nbsp;<b>{cfg.get('year','—')}</b>"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        "<div style='text-align:center;font-size:.68rem;color:#bbb;margin-top:2rem'>"
+        "v2.0 · APRIL Fiber R&D</div>",
+        unsafe_allow_html=True,
+    )
+
+page = st.session_state.page
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE 1 — STOCK TAKE REPORT GENERATOR
+# ══════════════════════════════════════════════════════════════════════════════
+if page == "stock_take":
+    st.title("📋 Stock Take Report Generator")
+    st.caption("APRIL Fiber R&D — Quarterly Stock Take Automation")
+    st.divider()
+
+    tab_upload, tab_config, tab_generate = st.tabs(
+        ["📁 Upload Files", "⚙️ Configuration", "📄 Generate Report"]
+    )
+
+    # ── Tab 1: Upload ─────────────────────────────────────────────────────────
+    with tab_upload:
+        st.info(
+            "Upload all 9 Excel files (7 store + 2 Non-Moving Stock). "
+            "Each store file needs a sheet named **auto**.  \n"
+            "Stores: `PHL` · `SOL` · `BIO` · `RDS` · `KRN` · `SEED` · `TCL`  \n"
+            "Non-Moving: filename must contain `Non Moving` + `4413` or `4414`"
+        )
+        uploaded_files = st.file_uploader(
+            "Upload Excel files", type=["xlsx", "xls"], accept_multiple_files=True
+        )
+        if uploaded_files:
+            for f in uploaded_files:
+                nm_def = detect_nm_file(f.name)
+                if nm_def:
+                    data, err = parse_nm_file(f, nm_def)
+                    if err:
+                        st.error(f"❌ **{f.name}** (NM {nm_def['sloc']}) — {err}")
+                        st.session_state.nm_results.pop(nm_def["sloc"], None)
+                    else:
+                        st.session_state.nm_results[nm_def["sloc"]] = {"data": data, "filename": f.name}
+                        q = extract_quarter_from_filename(f.name); y = extract_year_from_filename(f.name)
+                        if q: st.session_state.detected_q = q; cfg["quarter"] = q
+                        if y: st.session_state.detected_y = y; cfg["year"]    = y
+                    continue
+                store_def = detect_store(f.name)
+                if store_def is None:
+                    st.error(f"❌ **{f.name}** — unrecognised filename"); continue
+                data, err = parse_store_file(f, store_def)
                 if err:
-                    st.error(f"❌ **{f.name}** (Non-Moving {nm_def['sloc']}) — {err}")
-                    st.session_state.nm_results.pop(nm_def["sloc"],None)
+                    st.error(f"❌ **{f.name}** ({store_def['name']}) — {err}")
+                    st.session_state.stores_results.pop(store_def["key"], None)
                 else:
-                    st.session_state.nm_results[nm_def["sloc"]]={"data":data,"filename":f.name}
-                    q=extract_quarter_from_filename(f.name); y=extract_year_from_filename(f.name)
-                    if q: st.session_state.detected_q=q; cfg["quarter"]=q
-                    if y: st.session_state.detected_y=y; cfg["year"]=y
-                continue
-            store_def=detect_store(f.name)
-            if store_def is None:
-                st.error(f"❌ **{f.name}** — cannot detect (expected: PHL/SOL/BIO/RDS/KRN/SEED/TCL or Non-Moving with 4413/4414)")
-                continue
-            data,err=parse_store_file(f,store_def)
-            if err:
-                st.error(f"❌ **{f.name}** ({store_def['name']}) — {err}")
-                st.session_state.stores_results.pop(store_def["key"],None)
-            else:
-                st.session_state.stores_results[store_def["key"]]={"data":data,"filename":f.name,"store_def":store_def}
-                q=extract_quarter_from_filename(f.name); y=extract_year_from_filename(f.name)
-                if q: st.session_state.detected_q=q; cfg["quarter"]=q
-                if y: st.session_state.detected_y=y; cfg["year"]=y
+                    st.session_state.stores_results[store_def["key"]] = {
+                        "data": data, "filename": f.name, "store_def": store_def
+                    }
+                    q = extract_quarter_from_filename(f.name); y = extract_year_from_filename(f.name)
+                    if q: st.session_state.detected_q = q; cfg["quarter"] = q
+                    if y: st.session_state.detected_y = y; cfg["year"]    = y
 
-    # ── Auto-detect date range from all uploaded store filenames ──────────────
-    all_dates = []
-    for key, result in st.session_state.stores_results.items():
-        d = result["data"].get("date_from_file")
-        if d:
-            try:
-                from datetime import datetime as dt
-                parsed = dt.strptime(d, "%d-%b-%Y")
-                all_dates.append((parsed, d))
-            except: pass
-    if all_dates:
-        all_dates.sort(key=lambda x: x[0])
-        earliest = all_dates[0][1]
-        latest   = all_dates[-1][1]
-        if cfg.get("start_date") != earliest or cfg.get("end_date") != latest:
-            cfg["start_date"] = earliest
-            cfg["end_date"]   = latest
+        # Auto-detect date range
+        all_dates = []
+        for result in st.session_state.stores_results.values():
+            d = result["data"].get("date_from_file")
+            if d:
+                try:
+                    parsed = datetime.strptime(d, "%d-%b-%Y")
+                    all_dates.append((parsed, d))
+                except: pass
+        if all_dates:
+            all_dates.sort(key=lambda x: x[0])
+            earliest, latest = all_dates[0][1], all_dates[-1][1]
+            if cfg.get("start_date") != earliest or cfg.get("end_date") != latest:
+                cfg["start_date"] = earliest; cfg["end_date"] = latest; save_config(cfg)
+        if st.session_state.detected_q or st.session_state.detected_y:
+            st.success(f"📅 Auto-detected — Quarter: **{cfg.get('quarter','?')}** | Year: **{cfg.get('year','?')}**")
+
+        st.divider()
+        store_ok = [s for s in STORE_DEFS if s["key"] in st.session_state.stores_results]
+        nm_ok    = [n for n in NM_DEFS    if n["sloc"] in st.session_state.nm_results]
+        total_ok = len(store_ok) + len(nm_ok)
+        total_all = len(STORE_DEFS) + len(NM_DEFS)
+        if total_ok == total_all:
+            st.success(f"✅ All {total_all} files loaded and ready.")
+        else:
+            st.warning(f"📂 {total_ok}/{total_all} files loaded.")
+
+        st.markdown("##### 🏪 Store Files")
+        for sd in STORE_DEFS:
+            result = st.session_state.stores_results.get(sd["key"])
+            c1, c2, c3 = st.columns([2, 1, 5])
+            c1.write(f"**{sd['name']}**")
+            if result:
+                dr = result["data"]; tot = dr.get("total", {}); var = tot.get("var", 0)
+                c2.success("✅ OK")
+                vt = ("Zero var" if var == 0
+                      else f"▲ Surplus {fmt_idr(var)}" if var > 0
+                      else f"▼ Deficit {fmt_idr(abs(var))}")
+                dt_txt = f" · 📅 {dr.get('date_from_file','')}" if dr.get("date_from_file") else ""
+                c3.caption(f"MC: **{tot.get('mc',0)}** · SAP: {fmt_idr(tot.get('sap',0))} · {vt}{dt_txt}")
+            else:
+                c2.error("⏳ Missing")
+                c3.caption(f"Upload file with keyword `{sd['key']}`")
+
+        st.markdown("##### 📦 Non-Moving Stock Files")
+        for nm_def in NM_DEFS:
+            result = st.session_state.nm_results.get(nm_def["sloc"])
+            c1, c2, c3 = st.columns([2, 1, 5])
+            c1.write(f"**SLoc {nm_def['sloc']}** — {nm_def['desc']}")
+            if result:
+                d = result["data"]
+                c2.success("✅ OK")
+                c3.caption(f"MC: **{d['count']}** · Value: IDR {fmt_idr(d['value'])}")
+            else:
+                c2.error("⏳ Missing")
+                c3.caption(f"Upload `Non Moving Stock Report {nm_def['sloc']} - Q?.xlsx`")
+
+    # ── Tab 2: Config ─────────────────────────────────────────────────────────
+    with tab_config:
+        st.subheader("Report Configuration")
+        changed = False
+        if st.session_state.detected_q or st.session_state.detected_y:
+            st.info(f"📅 Auto-detected — Quarter: **{cfg.get('quarter','?')}** · Year: **{cfg.get('year','?')}**")
+
+        st.markdown("**📅 Stock Take Period**")
+        c1, c2 = st.columns(2)
+        with c1:
+            v = st.text_input("Start Date", cfg["start_date"], help="e.g. 22-Sep-2025")
+            if v != cfg["start_date"]: cfg["start_date"] = v; changed = True
+        with c2:
+            v = st.text_input("End Date", cfg["end_date"])
+            if v != cfg["end_date"]: cfg["end_date"] = v; changed = True
+
+        st.markdown("**👤 Signatories**")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            v = st.text_input("Prepared By", cfg["prepared_by"])
+            if v != cfg["prepared_by"]: cfg["prepared_by"] = v; changed = True
+        with c2:
+            v = st.text_input("Acknowledged By", cfg["acknowledged_by"])
+            if v != cfg["acknowledged_by"]: cfg["acknowledged_by"] = v; changed = True
+        with c3:
+            v = st.text_input("Approved By", cfg["approved_by"])
+            if v != cfg["approved_by"]: cfg["approved_by"] = v; changed = True
+            v = st.text_input("Approved By Title", cfg["approved_title"])
+            if v != cfg["approved_title"]: cfg["approved_title"] = v; changed = True
+
+        st.markdown("**🏪 Per-Store Overrides**")
+        if "store_overrides" not in cfg: cfg["store_overrides"] = {}
+        for sd in STORE_DEFS:
+            sname = sd["name"]
+            if sname not in cfg["store_overrides"]: cfg["store_overrides"][sname] = {}
+            ov = cfg["store_overrides"][sname]
+            with st.expander(f"{sname}", expanded=False):
+                c1, c2 = st.columns(2)
+                with c1:
+                    v = st.text_input("PIC", ov.get("pic", sd["default_pic"]), key=f"pic_{sd['key']}")
+                    if v != ov.get("pic", sd["default_pic"]): ov["pic"] = v; changed = True
+                with c2:
+                    v = st.text_input("Stock Take Date", ov.get("stock_take_date", cfg["start_date"]), key=f"date_{sd['key']}")
+                    if v != ov.get("stock_take_date", cfg["start_date"]): ov["stock_take_date"] = v; changed = True
+                st.caption("Leave blank to auto-generate remarks")
+                v = st.text_area("Performance Note", ov.get("performance_note", ""), height=60, key=f"perf_{sd['key']}")
+                if v != ov.get("performance_note", ""): ov["performance_note"] = v or None; changed = True
+                v = st.text_area("Action Note", ov.get("action_note", ""), height=60, key=f"act_{sd['key']}")
+                if v != ov.get("action_note", ""): ov["action_note"] = v or None; changed = True
+                if sd["seed"]:
+                    res = st.session_state.stores_results.get(sd["key"])
+                    if res:
+                        d = res["data"]
+                        st.info(f"🌱 Lots: **{d.get('seed_lots_count','?')}** · Species: **{d.get('species_count','?')}** · Weight: **{d.get('total_weight_tons','?')}**")
+
+        st.markdown("**📦 Non-Moving Stock (fallback)**")
+        nm = cfg.get("non_moving", [
+            {"sloc": "4413", "desc": "R&D Stores",  "count": 0, "value": 0},
+            {"sloc": "4414", "desc": "KTC Store",   "count": 0, "value": 0},
+        ])
+        for i, entry in enumerate(nm):
+            c1, c2, c3, c4 = st.columns([1, 2, 1, 2])
+            with c1:
+                v = st.text_input("SLoc", entry["sloc"], key=f"nm_sloc_{i}")
+                if v != entry["sloc"]: nm[i]["sloc"] = v; changed = True
+            with c2:
+                v = st.text_input("Description", entry["desc"], key=f"nm_desc_{i}")
+                if v != entry["desc"]: nm[i]["desc"] = v; changed = True
+            with c3:
+                v = st.number_input("MC Count", value=entry["count"], key=f"nm_cnt_{i}", min_value=0)
+                if v != entry["count"]: nm[i]["count"] = v; changed = True
+            with c4:
+                v = st.number_input("Total Value (IDR)", value=entry["value"], key=f"nm_val_{i}", min_value=0, step=1_000_000)
+                if v != entry["value"]: nm[i]["value"] = v; changed = True
+        cfg["non_moving"] = nm
+        if st.button("💾 Save Configuration", type="primary"):
+            save_config(cfg); st.success("✅ Saved!")
+        elif changed:
             save_config(cfg)
 
-    if st.session_state.detected_q or st.session_state.detected_y:
-        st.info(f"📅 Auto-detected — Quarter: **{cfg.get('quarter','?')}** | Year: **{cfg.get('year','?')}**")
-    if all_dates and len(set(d for _,d in all_dates)) > 1:
-        st.info(f"📅 Stock take period auto-detected — **{cfg['start_date']}** to **{cfg['end_date']}**")
-    elif all_dates:
-        st.info(f"📅 Stock take date auto-detected — **{cfg['start_date']}**")
+    # ── Tab 3: Generate ───────────────────────────────────────────────────────
+    with tab_generate:
+        st.subheader("Generate Report")
+        loaded  = [s for s in STORE_DEFS if s["key"] in st.session_state.stores_results]
+        missing = [s for s in STORE_DEFS if s["key"] not in st.session_state.stores_results]
+        nm_miss = [n for n in NM_DEFS    if n["sloc"] not in st.session_state.nm_results]
+        if missing: st.warning(f"Missing stores: {', '.join(s['name'] for s in missing)}")
+        if nm_miss: st.info(f"NM files missing ({', '.join('SLoc '+n['sloc'] for n in nm_miss)}) — config fallback used.")
+        if loaded:  st.success(f"✅ {len(loaded)}/7 stores loaded · Q{cfg.get('quarter','?')} {cfg.get('year','?')}")
 
-    st.markdown("---")
-    store_loaded=[sd for sd in STORE_DEFS if sd["key"] in st.session_state.stores_results]
-    nm_loaded_list=[nm for nm in NM_DEFS if nm["sloc"] in st.session_state.nm_results]
-    total_ok=len(store_loaded)+len(nm_loaded_list)
-    total_all=len(STORE_DEFS)+len(NM_DEFS)
-    if total_ok==total_all:
-        st.markdown(f'<div class="ok">✅ All {total_all} files loaded and ready!</div>',unsafe_allow_html=True)
-    else:
-        st.markdown(f'<div class="warn">📂 {total_ok}/{total_all} files loaded.</div>',unsafe_allow_html=True)
+        if st.session_state.stores_results:
+            with st.expander("👁️ Preview auto-generated remarks"):
+                for sd in STORE_DEFS:
+                    r = st.session_state.stores_results.get(sd["key"])
+                    if not r: continue
+                    perf, action = auto_remarks(sd["name"], r["data"], cfg)
+                    st.markdown(f"**{sd['name']}**")
+                    if perf:   st.info(f"📝 {perf}")
+                    if action: st.warning(f"⚠️ {action}")
+                    if not perf and not action: st.caption("_(auto-fill after download)_")
 
-    st.markdown("##### 🏪 Store Files (7)")
-    for sd in STORE_DEFS:
-        result=st.session_state.stores_results.get(sd["key"])
-        c1,c2,c3=st.columns([3,2,5]); c1.markdown(f"**{sd['name']}**")
-        if result:
-            dr=result["data"]; tot=dr.get("total",{}); var=tot.get("var",0)
-            c2.markdown('<span class="store-ok">✅ Loaded</span>',unsafe_allow_html=True)
-            vt="✅ Zero Var" if var==0 else (f"🔼 Surplus: {fmt_idr(var)}" if var>0 else f"🔽 Deficit: {fmt_idr(abs(var))}")
-            date_detected=dr.get("date_from_file","")
-            date_txt=f" &nbsp;|&nbsp; 📅 {date_detected}" if date_detected else ""
-            c3.markdown(f"MC: **{tot.get('mc',0)}** &nbsp;|&nbsp; SAP: {fmt_idr(tot.get('sap',0))} &nbsp;|&nbsp; {vt}{date_txt}")
-        else:
-            c2.markdown('<span class="store-err">⏳ Missing</span>',unsafe_allow_html=True)
-            c3.markdown(f"<small>Upload file with keyword <code>{sd['key']}</code></small>",unsafe_allow_html=True)
-
-    st.markdown("##### 📦 Non-Moving Stock Files (2)")
-    for nm_def in NM_DEFS:
-        result=st.session_state.nm_results.get(nm_def["sloc"])
-        c1,c2,c3=st.columns([3,2,5]); c1.markdown(f"**S.Loc {nm_def['sloc']}** — {nm_def['desc']}")
-        if result:
-            d=result["data"]; c2.markdown('<span class="store-ok">✅ Loaded</span>',unsafe_allow_html=True)
-            c3.markdown(f"MC: **{d['count']}** &nbsp;|&nbsp; Value: IDR {fmt_idr(d['value'])} &nbsp;|&nbsp; <small><i>{result['filename']}</i></small>",unsafe_allow_html=True)
-        else:
-            c2.markdown('<span class="store-err">⏳ Missing</span>',unsafe_allow_html=True)
-            c3.markdown(f"<small>Upload <code>Non Moving Stock Report {nm_def['sloc']} - Q?.xlsx</code></small>",unsafe_allow_html=True)
-
-with tab_config:
-    st.markdown("### Report Configuration")
-    changed=False
-    if st.session_state.detected_q or st.session_state.detected_y:
-        st.info(f"📅 Auto-detected from filenames — Quarter: **{cfg.get('quarter','?')}** | Year: **{cfg.get('year','?')}**")
-
-    st.markdown("#### 📅 Stock Take Period")
-    st.caption("Auto-filled from filenames (earliest → latest date). Override manually if needed.")
-    c1,c2=st.columns(2)
-    with c1:
-        v=st.text_input("Stock Take Start Date",cfg["start_date"],help="e.g. 22-Sep-2025")
-        if v!=cfg["start_date"]: cfg["start_date"]=v; changed=True
-    with c2:
-        v=st.text_input("Stock Take End Date",cfg["end_date"])
-        if v!=cfg["end_date"]: cfg["end_date"]=v; changed=True
-
-    st.markdown("#### 👤 Signatories")
-    c1,c2,c3=st.columns(3)
-    with c1:
-        v=st.text_input("Prepared By",cfg["prepared_by"])
-        if v!=cfg["prepared_by"]: cfg["prepared_by"]=v; changed=True
-    with c2:
-        v=st.text_input("Acknowledged By",cfg["acknowledged_by"])
-        if v!=cfg["acknowledged_by"]: cfg["acknowledged_by"]=v; changed=True
-    with c3:
-        v=st.text_input("Approved By",cfg["approved_by"])
-        if v!=cfg["approved_by"]: cfg["approved_by"]=v; changed=True
-        v=st.text_input("Approved By Title",cfg["approved_title"])
-        if v!=cfg["approved_title"]: cfg["approved_title"]=v; changed=True
-
-    st.markdown("#### 🏪 Per-Store Overrides")
-    if "store_overrides" not in cfg: cfg["store_overrides"]={}
-    for sd in STORE_DEFS:
-        sname=sd["name"]
-        if sname not in cfg["store_overrides"]: cfg["store_overrides"][sname]={}
-        ov=cfg["store_overrides"][sname]
-        with st.expander(f"**{sname}**",expanded=False):
-            c1,c2=st.columns(2)
-            with c1:
-                v=st.text_input("PIC",ov.get("pic",sd["default_pic"]),key=f"pic_{sd['key']}")
-                if v!=ov.get("pic",sd["default_pic"]): ov["pic"]=v; changed=True
-            with c2:
-                v=st.text_input("Stock Take Date",ov.get("stock_take_date",cfg["start_date"]),key=f"date_{sd['key']}")
-                if v!=ov.get("stock_take_date",cfg["start_date"]): ov["stock_take_date"]=v; changed=True
-            st.caption("✏️ Custom remarks (leave blank for auto-generated)")
-            v=st.text_area("Performance Note",ov.get("performance_note",""),height=60,key=f"perf_{sd['key']}")
-            if v!=ov.get("performance_note",""): ov["performance_note"]=v if v else None; changed=True
-            v=st.text_area("Action Note",ov.get("action_note",""),height=60,key=f"act_{sd['key']}")
-            if v!=ov.get("action_note",""): ov["action_note"]=v if v else None; changed=True
-            if sd["seed"]:
-                result=st.session_state.stores_results.get(sd["key"])
-                if result:
-                    d=result["data"]
-                    st.info(f"🌱 Seed Lots: **{d.get('seed_lots_count','?')}** | Species: **{d.get('species_count','?')}** | Weight: **{d.get('total_weight_tons','?')}**")
-                else:
-                    st.caption("🌱 Upload SEED file to auto-compute.")
-
-    st.markdown("#### 📦 Non-Moving Stock (fallback if files not uploaded)")
-    nm=cfg.get("non_moving",[{"sloc":"4413","desc":"R&D Stores","count":0,"value":0},
-                               {"sloc":"4414","desc":"KTC Store","count":0,"value":0}])
-    for i,entry in enumerate(nm):
-        c1,c2,c3,c4=st.columns([2,3,2,3])
+        q = cfg.get("quarter", "Q?"); y = cfg.get("year", "????")
+        fname = f"Stock_Take_Report_{q}_{y}"
+        c1, c2 = st.columns(2)
         with c1:
-            v=st.text_input("S.Loc",entry["sloc"],key=f"nm_sloc_{i}")
-            if v!=entry["sloc"]: nm[i]["sloc"]=v; changed=True
+            if st.button("📝 Generate Word (.docx)", use_container_width=True,
+                         type="primary", disabled=not loaded):
+                with st.spinner("Generating…"):
+                    buf = generate_docx(cfg, st.session_state.stores_results)
+                    st.download_button(
+                        f"⬇️ Download {fname}.docx", buf,
+                        file_name=f"{fname}.docx",
+                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                        use_container_width=True,
+                    )
         with c2:
-            v=st.text_input("Description",entry["desc"],key=f"nm_desc_{i}")
-            if v!=entry["desc"]: nm[i]["desc"]=v; changed=True
-        with c3:
-            v=st.number_input("MC Count",value=entry["count"],key=f"nm_cnt_{i}",min_value=0)
-            if v!=entry["count"]: nm[i]["count"]=v; changed=True
-        with c4:
-            v=st.number_input("Total Value (IDR)",value=entry["value"],key=f"nm_val_{i}",min_value=0,step=1000000)
-            if v!=entry["value"]: nm[i]["value"]=v; changed=True
-    cfg["non_moving"]=nm
-    if st.button("💾 Save Configuration",type="primary"):
-        save_config(cfg); st.success("✅ Saved!")
-    elif changed:
-        save_config(cfg)
+            if st.button("📄 Generate PDF", use_container_width=True,
+                         type="primary", disabled=not loaded):
+                with st.spinner("Generating…"):
+                    buf = generate_pdf(cfg, st.session_state.stores_results)
+                    st.download_button(
+                        f"⬇️ Download {fname}.pdf", buf,
+                        file_name=f"{fname}.pdf",
+                        mime="application/pdf",
+                        use_container_width=True,
+                    )
 
-with tab_generate:
-    st.markdown("### Generate Report")
-    loaded=[sd for sd in STORE_DEFS if sd["key"] in st.session_state.stores_results]
-    missing=[sd for sd in STORE_DEFS if sd["key"] not in st.session_state.stores_results]
-    nm_missing=[nm for nm in NM_DEFS if nm["sloc"] not in st.session_state.nm_results]
-    if missing:
-        st.markdown(f'<div class="warn">⚠️ Missing: {", ".join(sd["name"] for sd in missing)}</div>',unsafe_allow_html=True)
-    if nm_missing:
-        st.markdown(f'<div class="warn">⚠️ Missing NM files: {", ".join("S.Loc "+nm["sloc"] for nm in nm_missing)} — config fallback used.</div>',unsafe_allow_html=True)
-    if loaded:
-        q=cfg.get("quarter","?"); y=cfg.get("year","?")
-        st.markdown(f'<div class="ok">✅ {len(loaded)}/7 stores — Quarter: <b>{q}</b> | Year: <b>{y}</b></div>',unsafe_allow_html=True)
-    if st.session_state.stores_results:
-        with st.expander("👁️ Preview auto-generated remarks"):
-            for sd in STORE_DEFS:
-                r=st.session_state.stores_results.get(sd["key"])
-                if not r: continue
-                perf,action=auto_remarks(sd["name"],r["data"],cfg)
-                st.markdown(f"**{sd['name']}**")
-                if perf:   st.info(f"📝 {perf}")
-                if action: st.warning(f"⚠️ {action}")
-                if not perf and not action: st.caption("_(blank — admin fills after download)_")
-    q=cfg.get("quarter","Q?"); y=cfg.get("year","????")
-    fname=f"Stock_Take_Report_{q}_{y}"
-    c1,c2=st.columns(2)
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE 2 — STOCK REPORT UPDATER
+# ══════════════════════════════════════════════════════════════════════════════
+elif page == "stock_updater":
+    st.title("📊 Stock Report Updater")
+    st.caption(f"Append today's period ({date.today().strftime('%d %b %Y')}) from SAP transaction data")
+    st.divider()
+
+    c1, c2 = st.columns(2)
     with c1:
-        if st.button("📝 Generate Word (.docx)",use_container_width=True,type="primary",disabled=not loaded):
-            with st.spinner("Generating..."):
-                buf=generate_docx(cfg,st.session_state.stores_results)
-                st.download_button(f"⬇️ Download {fname}.docx",buf,file_name=f"{fname}.docx",
-                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",use_container_width=True)
+        st.markdown("**📋 Transaction File**")
+        trans_file = st.file_uploader(
+            "Transaction (.xlsx)", type=["xlsx"], key="trans_upload",
+            help="SAP GI/GR export — needs Material, Reference, Quantity columns.",
+        )
     with c2:
-        if st.button("📄 Generate PDF",use_container_width=True,type="primary",disabled=not loaded):
-            with st.spinner("Generating..."):
-                buf=generate_pdf(cfg,st.session_state.stores_results)
-                st.download_button(f"⬇️ Download {fname}.pdf",buf,file_name=f"{fname}.pdf",
-                    mime="application/pdf",use_container_width=True)
+        st.markdown("**📦 Stock Report File**")
+        stock_file = st.file_uploader(
+            "Stock Report (.xlsx)", type=["xlsx"], key="stock_upload",
+            help="Current stock report with Balance / GR / GI / Balance column groups.",
+        )
+
+    if not (trans_file and stock_file):
+        st.info("Upload both files above to continue.")
+    else:
+        with st.expander("👁️ Transaction preview — first 10 rows"):
+            try:
+                trans_file.seek(0)
+                df_prev = pd.read_excel(trans_file, sheet_name=0)
+                if "Section" not in df_prev.columns:
+                    ref_col = next((c for c in df_prev.columns if "reference" in str(c).lower()), None)
+                    if ref_col: df_prev["Section"] = df_prev[ref_col].apply(extract_section_from_ref)
+                if "Code" not in df_prev.columns:
+                    qty_col = next((c for c in df_prev.columns if str(c).lower() == "quantity"), None)
+                    if qty_col: df_prev["Code"] = df_prev[qty_col].apply(
+                        lambda x: "GI" if safe_float(x) < 0 else "GR")
+                if "Quantity(RemoveNegative)" not in df_prev.columns:
+                    qty_col = next((c for c in df_prev.columns if str(c).lower() == "quantity"), None)
+                    if qty_col: df_prev["Quantity(RemoveNegative)"] = df_prev[qty_col].apply(
+                        lambda x: abs(safe_float(x)))
+                show_cols = [c for c in [
+                    "Material", "Material Description", "Section",
+                    "Code", "Quantity", "Quantity(RemoveNegative)", "EUn",
+                ] if c in df_prev.columns]
+                st.dataframe(df_prev[show_cols].head(10), use_container_width=True)
+                trans_file.seek(0)
+            except Exception as e:
+                st.error(f"Could not read transaction file: {e}")
+
+        today_label = date.today().strftime("%d-%b-%Y")
+        st.info(
+            f"A new column group **{today_label}** (Balance · GR · GI · New Balance) "
+            "will be appended to the stock report."
+        )
+        if st.button("🔄 Generate Updated Stock Report", type="primary", use_container_width=True):
+            with st.spinner("Processing…"):
+                try:
+                    trans_file.seek(0); stock_file.seek(0)
+                    trans_df = prepare_transaction_df(trans_file)
+                    stock_file.seek(0)
+                    buf = generate_updated_stock_report(trans_df, stock_file)
+                    out_name = f"Stock_Report_Updated_{today_label}.xlsx"
+                    st.download_button(
+                        f"⬇️ Download {out_name}", buf,
+                        file_name=out_name,
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True, type="primary",
+                    )
+                    st.success("✅ Done — new date column appended with formulas.")
+                except Exception as e:
+                    st.error(f"❌ {e}")
