@@ -744,6 +744,49 @@ def prepare_transaction_df(uploaded_file):
         if qty_col: df['Quantity(RemoveNegative)'] = df[qty_col].apply(lambda x: abs(safe_float(x)))
     return df
 
+@st.cache_data(show_spinner=False)
+def cached_load_stock_keys(stock_bytes: bytes) -> set:
+    """Return set of (MC, Section) tuples. Uses pandas — fast, no openpyxl row iteration."""
+    # Row 1 = date headers, row 2 = column names → header=1 (0-indexed)
+    # Only read columns A (MC=0) and D (Section=3) — skip everything else
+    df = pd.read_excel(
+        io.BytesIO(stock_bytes),
+        header=1,          # row 2 in Excel is the real header
+        usecols=[0, 3],    # col A = MC, col D = Section
+        dtype=str,
+    )
+    df.columns = ["MC", "Section"]
+    df = df.dropna(subset=["MC"])
+    return set(
+        zip(df["MC"].str.strip(), df["Section"].fillna("").str.strip())
+    )
+
+@st.cache_data(show_spinner=False)
+def cached_load_transaction(trans_bytes: bytes) -> pd.DataFrame:
+    """Read and enrich transaction file. Cached by file content."""
+    df = pd.read_excel(io.BytesIO(trans_bytes), sheet_name=0)
+    # Derive Section — vectorised where possible
+    if "Section" not in df.columns:
+        ref_col = next((c for c in df.columns if "reference" in str(c).lower()), None)
+        if ref_col:
+            refs = df[ref_col].astype(str).str.strip()
+            has_slash = refs.str.contains("/", regex=False)
+            df["Section"] = refs.where(~has_slash, refs.str.split("/").str[0].str.strip())
+            df.loc[~has_slash, "Section"] = refs[~has_slash].str.split().str[:3].str.join(" ")
+    # Derive Code and Qty — vectorised
+    if "Code" not in df.columns:
+        qty_col = next((c for c in df.columns if str(c).lower() == "quantity"), None)
+        if qty_col:
+            df["Code"] = pd.to_numeric(df[qty_col], errors="coerce").fillna(0)
+            df["Code"] = df["Code"].apply(lambda x: "GI" if x < 0 else "GR")
+    if "Quantity(RemoveNegative)" not in df.columns:
+        qty_col = next((c for c in df.columns if str(c).lower() == "quantity"), None)
+        if qty_col:
+            df["Quantity(RemoveNegative)"] = pd.to_numeric(
+                df[qty_col], errors="coerce"
+            ).fillna(0).abs()
+    return df
+
 def generate_updated_stock_report(trans_df, stock_file):
     from openpyxl.utils import get_column_letter
     from datetime import datetime as dt
@@ -797,7 +840,10 @@ def generate_updated_stock_report(trans_df, stock_file):
     new_gi_letter   = get_column_letter(new_start+2)    # e.g. "W"
     new_final_letter= get_column_letter(new_start+3)    # e.g. "X"
 
-    # ── Data rows ────────────────────────────────────────────────────────────
+    # ── Data rows (existing items) ────────────────────────────────────────────
+    existing_keys = set()   # track (mc_str, sec_str) already in stock report
+    last_data_row = 2       # track last row with data (for style reference)
+
     for row_idx in range(3, ws.max_row + 1):
         mc_val  = ws.cell(row=row_idx, column=1).value
         sec_val = ws.cell(row=row_idx, column=4).value
@@ -805,30 +851,85 @@ def generate_updated_stock_report(trans_df, stock_file):
 
         mc_str  = str(mc_val).strip()
         sec_str = str(sec_val).strip() if sec_val is not None else ''
+        existing_keys.add((mc_str, sec_str))
+        last_data_row = row_idx
 
         gr = int(grp.get((mc_str, sec_str, 'GR'), 0))
         gi = int(grp.get((mc_str, sec_str, 'GI'), 0))
 
-        # Col new_start   : =prev_bal_col (formula, same as existing pattern)
-        # Col new_start+1 : GR  (hardcoded int)
-        # Col new_start+2 : GI  (hardcoded int)
-        # Col new_start+3 : =new_bal + GR - GI (formula)
         values_and_formulas = [
-            f"={prev_bal_letter}{row_idx}",   # Balance (carry forward)
-            gr,                                # GR
-            gi,                                # GI
-            f"={new_bal_letter}{row_idx}+{new_gr_letter}{row_idx}-{new_gi_letter}{row_idx}",  # new Balance
+            f"={prev_bal_letter}{row_idx}",
+            gr,
+            gi,
+            f"={new_bal_letter}{row_idx}+{new_gr_letter}{row_idx}-{new_gi_letter}{row_idx}",
         ]
         for i, val in enumerate(values_and_formulas):
             cell = ws.cell(row=row_idx, column=new_start+i)
             cell.value = val
             src3 = ws.cell(row=row_idx, column=prev_start_col+i)
             if src3.has_style:
-                cell.font         = copy.copy(src3.font)
-                cell.fill         = copy.copy(src3.fill)
-                cell.alignment    = copy.copy(src3.alignment)
-                cell.border       = copy.copy(src3.border)
+                cell.font          = copy.copy(src3.font)
+                cell.fill          = copy.copy(src3.fill)
+                cell.alignment     = copy.copy(src3.alignment)
+                cell.border        = copy.copy(src3.border)
                 cell.number_format = src3.number_format
+
+    # ── New items — materials in transaction not yet in stock report ──────────
+    # Build lookup: (mc, sec) -> (desc, eun) from transaction
+    desc_col = next((c for c in trans_df.columns if 'description' in str(c).lower()), None)
+    eun_col  = next((c for c in trans_df.columns
+                     if str(c).lower() in ('eun', 'uom', 'unit', 'base unit')), None)
+
+    trans_meta = {}   # (mc, sec) -> (desc, eun)
+    for _, row in trans_df[['_mat', '_sec']
+                            + ([desc_col] if desc_col else [])
+                            + ([eun_col]  if eun_col  else [])].drop_duplicates().iterrows():
+        key = (str(row['_mat']).strip(), str(row['_sec']).strip())
+        if key not in trans_meta:
+            trans_meta[key] = (
+                str(row[desc_col]).strip() if desc_col else '',
+                str(row[eun_col]).strip()  if eun_col  else '',
+            )
+
+    new_items = [(k, v) for k, v in trans_meta.items() if k not in existing_keys]
+    new_items.sort(key=lambda x: (x[0][1], x[0][0]))   # sort by Section then MC
+
+    for (mc_str, sec_str), (desc, eun) in new_items:
+        row_idx = ws.max_row + 1
+
+        # Copy row style from last data row
+        def _copy_cell(src_row, src_col, dst_row, dst_col, value):
+            dst = ws.cell(row=dst_row, column=dst_col)
+            dst.value = value
+            src = ws.cell(row=src_row, column=src_col)
+            if src.has_style:
+                dst.font      = copy.copy(src.font)
+                dst.fill      = copy.copy(src.fill)
+                dst.alignment = copy.copy(src.alignment)
+                dst.border    = copy.copy(src.border)
+                dst.number_format = src.number_format
+
+        # Fixed columns: MC, Description, EUn, Section
+        _copy_cell(last_data_row, 1, row_idx, 1, mc_str)
+        _copy_cell(last_data_row, 2, row_idx, 2, desc)
+        _copy_cell(last_data_row, 3, row_idx, 3, eun)
+        _copy_cell(last_data_row, 4, row_idx, 4, sec_str)
+
+        # Previous period columns — fill with 0 so formulas resolve cleanly
+        for col in range(5, new_start):
+            _copy_cell(last_data_row, col, row_idx, col, 0)
+
+        # New period: Balance=0 (no prior stock), GR, GI, final Balance
+        gr = int(grp.get((mc_str, sec_str, 'GR'), 0))
+        gi = int(grp.get((mc_str, sec_str, 'GI'), 0))
+        new_period = [
+            0,      # Balance (new item — no previous balance)
+            gr,
+            gi,
+            f"={new_bal_letter}{row_idx}+{new_gr_letter}{row_idx}-{new_gi_letter}{row_idx}",
+        ]
+        for i, val in enumerate(new_period):
+            _copy_cell(last_data_row, prev_start_col+i, row_idx, new_start+i, val)
 
     buf = io.BytesIO(); wb.save(buf); buf.seek(0)
     return buf
@@ -1152,29 +1253,66 @@ elif page == "stock_updater":
     if not (trans_file and stock_file):
         st.info("Upload both files above to continue.")
     else:
-        with st.expander("👁️ Transaction preview — first 10 rows"):
-            try:
-                trans_file.seek(0)
-                df_prev = pd.read_excel(trans_file, sheet_name=0)
-                if "Section" not in df_prev.columns:
-                    ref_col = next((c for c in df_prev.columns if "reference" in str(c).lower()), None)
-                    if ref_col: df_prev["Section"] = df_prev[ref_col].apply(extract_section_from_ref)
-                if "Code" not in df_prev.columns:
-                    qty_col = next((c for c in df_prev.columns if str(c).lower() == "quantity"), None)
-                    if qty_col: df_prev["Code"] = df_prev[qty_col].apply(
-                        lambda x: "GI" if safe_float(x) < 0 else "GR")
-                if "Quantity(RemoveNegative)" not in df_prev.columns:
-                    qty_col = next((c for c in df_prev.columns if str(c).lower() == "quantity"), None)
-                    if qty_col: df_prev["Quantity(RemoveNegative)"] = df_prev[qty_col].apply(
-                        lambda x: abs(safe_float(x)))
-                show_cols = [c for c in [
-                    "Material", "Material Description", "Section",
-                    "Code", "Quantity", "Quantity(RemoveNegative)", "EUn",
-                ] if c in df_prev.columns]
-                st.dataframe(df_prev[show_cols].head(10), use_container_width=True)
-                trans_file.seek(0)
-            except Exception as e:
-                st.error(f"Could not read transaction file: {e}")
+        try:
+            # ── Load both files (cached by content — fast on re-render) ──
+            trans_bytes = trans_file.read(); trans_file.seek(0)
+            stock_bytes = stock_file.read(); stock_file.seek(0)
+
+            df_prev       = cached_load_transaction(trans_bytes)
+            existing_keys = cached_load_stock_keys(stock_bytes)
+
+            # ── Vectorised new-item flag ──────────────────────────────────
+            df_prev = df_prev.copy()
+            df_prev["_mat"] = df_prev["Material"].astype(str).str.strip()
+            df_prev["_sec"] = df_prev["Section"].astype(str).str.strip()
+            # pd.MultiIndex lookup — vectorised, no row-by-row apply
+            idx = pd.MultiIndex.from_arrays([df_prev["_mat"], df_prev["_sec"]])
+            df_prev["is_new"] = ~idx.isin(pd.MultiIndex.from_tuples(existing_keys))
+
+            # ── New materials summary ─────────────────────────────────────
+            desc_col = next((c for c in df_prev.columns if "description" in str(c).lower()), None)
+            eun_col  = next((c for c in df_prev.columns if str(c).lower() in ("eun","uom","unit")), None)
+            summary_cols = ["Material"] + ([desc_col] if desc_col else []) +                            ["Section"]  + ([eun_col]  if eun_col  else [])
+            summary_cols = [c for c in summary_cols if c in df_prev.columns]
+
+            new_mc_df = (
+                df_prev[df_prev["is_new"]][summary_cols]
+                .drop_duplicates()
+                .sort_values(["Section", "Material"])
+                .reset_index(drop=True)
+            )
+            n_new = len(new_mc_df)
+
+            if n_new:
+                st.warning(
+                    f"**{n_new} new material(s)** found in the transaction that are not yet "
+                    "in the stock report — they will be appended as new rows."
+                )
+                with st.expander(f"📋 View {n_new} new material(s)", expanded=True):
+                    st.dataframe(new_mc_df, use_container_width=True, hide_index=True)
+            else:
+                st.success("✅ All transaction materials already exist in the stock report.")
+
+            # ── Full transaction preview (two plain tables, no Styler) ────
+            show_cols = [c for c in [
+                "Material", "Material Description", "Section",
+                "Code", "Quantity", "Quantity(RemoveNegative)", "EUn",
+            ] if c in df_prev.columns]
+
+            with st.expander("👁️ Full transaction preview", expanded=False):
+                new_rows = df_prev[df_prev["is_new"]][show_cols].drop_duplicates()
+                old_rows = df_prev[~df_prev["is_new"]][show_cols].drop_duplicates()
+                if not new_rows.empty:
+                    st.markdown(f"**🟡 New items ({len(new_rows)} rows)**")
+                    st.dataframe(new_rows.reset_index(drop=True),
+                                 use_container_width=True, hide_index=True)
+                if not old_rows.empty:
+                    st.markdown(f"**Existing items ({len(old_rows)} rows)**")
+                    st.dataframe(old_rows.reset_index(drop=True),
+                                 use_container_width=True, hide_index=True)
+
+        except Exception as e:
+            st.error(f"Could not process files: {e}")
 
         today_label = date.today().strftime("%d-%b-%Y")
         st.info(

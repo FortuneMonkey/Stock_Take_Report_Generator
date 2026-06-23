@@ -934,6 +934,106 @@ def generate_updated_stock_report(trans_df, stock_file):
     buf = io.BytesIO(); wb.save(buf); buf.seek(0)
     return buf
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PETTY CASH AUTOMATION
+# ══════════════════════════════════════════════════════════════════════════════
+
+PC_MEASURE_UNITS = {
+    "EA","CYL","BT","LGT","SET","L","CAN","ASY","ROL","KG","M3","BAG","BOX",
+    "PAA","ML","UN","SHT","PAC","G","KIT","TUB","PL","PAD","OZ","PAIL","M",
+    "DZ","IDR","Gram","METER","AU","RM","PC","GAL","TO","Pak","test","TON",
+    "VL","LOT",
+}
+
+def pc_parse_qty_unit(description):
+    matches = re.findall(r'\(([^)]+)\)', description)
+    if not matches: return None, None
+    last = matches[-1].strip()
+    m = re.match(r'^([\d.,]+)\s*([A-Za-z]+)$', last)
+    if not m: return None, None
+    qty_str, unit = m.group(1), m.group(2)
+    if unit not in PC_MEASURE_UNITS and unit.lower() not in {u.lower() for u in PC_MEASURE_UNITS}:
+        return None, None
+    try:
+        qty = float(qty_str.replace(",", ""))
+        qty = int(qty) if qty == int(qty) else qty
+    except ValueError:
+        return None, None
+    return qty, unit
+
+def pc_find_claim_start(ws_summary):
+    # Use enumerate — avoids relying on cell.row which fails on EmptyCell in read_only mode
+    for row_idx, row in enumerate(ws_summary.iter_rows(values_only=True), start=1):
+        for val in row:
+            if val and "Current claim" in str(val):
+                return row_idx + 1
+    raise ValueError("Could not find 'Current claim' row in Summary sheet.")
+
+def pc_collect_items(ws_summary, start_row):
+    items = []
+    for row_idx, row in enumerate(ws_summary.iter_rows(values_only=True), start=1):
+        if row_idx < start_row:
+            continue
+        # row is a tuple of values; col F=index5, col H=index7
+        f_val = row[5] if len(row) > 5 else None
+        h_val = row[7] if len(row) > 7 else None
+        if f_val and "Total" in str(f_val):
+            break
+        if f_val and h_val:
+            items.append((row_idx, str(f_val).strip(), h_val))
+    return items
+
+def pc_process_file(file_bytes: bytes, filename: str) -> bytes:
+    """Process one petty cash Excel — fill Journal sheet, return updated bytes."""
+    wb = openpyxl.load_workbook(io.BytesIO(file_bytes))
+    if "Summary" not in wb.sheetnames:
+        raise ValueError(f"{filename}: Sheet 'Summary' not found.")
+    if "Journal" not in wb.sheetnames:
+        raise ValueError(f"{filename}: Sheet 'Journal' not found.")
+
+    ws_s = wb["Summary"]
+    ws_j = wb["Journal"]
+
+    claim_start = pc_find_claim_start(ws_s)
+    items = pc_collect_items(ws_s, claim_start)
+    if not items:
+        raise ValueError(f"{filename}: No claim items found.")
+
+    JOURNAL_START = 4
+    COL_REF, COL_CC, COL_DHT, COL_DOC, COL_POST, COL_CUR = 1, 2, 3, 4, 5, 6
+    COL_AMT_DOC, COL_AMT_LOC, COL_QTY, COL_UNIT = 10, 11, 13, 14
+    COL_ASSIGN, COL_TEXT = 15, 16
+
+    # Header row
+    ws_j.cell(JOURNAL_START, COL_REF).value   = "PC/R&D"
+    ws_j.cell(JOURNAL_START, COL_CC).value    = 2007
+    ws_j.cell(JOURNAL_START, COL_DHT).value   = "Reimbursement"
+    ws_j.cell(JOURNAL_START, COL_CUR).value   = "IDR"
+
+    src_fmt = ws_s["E4"].number_format
+    date_fmt = src_fmt if src_fmt and src_fmt != "General" else "dd/mm/yyyy"
+    for col in (COL_DOC, COL_POST):
+        c = ws_j.cell(JOURNAL_START, col)
+        c.value = "=Summary!E4"
+        c.number_format = date_fmt
+
+    # Per-item rows
+    for idx, (sum_row, desc, _credit) in enumerate(items):
+        j_row = JOURNAL_START + idx
+        ws_j.cell(j_row, COL_TEXT).value     = f"=Summary!F{sum_row}"
+        ws_j.cell(j_row, COL_AMT_DOC).value  = f"=Summary!H{sum_row}"
+        ws_j.cell(j_row, COL_AMT_LOC).value  = "IDR"
+        ws_j.cell(j_row, COL_ASSIGN).value   = "R&D"
+        qty, unit = pc_parse_qty_unit(desc)
+        ws_j.cell(j_row, COL_QTY).value  = qty
+        ws_j.cell(j_row, COL_UNIT).value = unit
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf.getvalue(), len(items)
+
 # ══════════════════════════════════════════════════════════════════════════════
 # UI
 # ══════════════════════════════════════════════════════════════════════════════
@@ -966,6 +1066,9 @@ with st.sidebar:
     if st.button("📊  Stock Report Updater", use_container_width=True,
                  type="primary" if p == "stock_updater" else "secondary", key="nav_su"):
         st.session_state.page = "stock_updater"; st.rerun()
+    if st.button("💰  Petty Cash", use_container_width=True,
+                 type="primary" if p == "petty_cash" else "secondary", key="nav_pc"):
+        st.session_state.page = "petty_cash"; st.rerun()
 
     st.divider()
 
@@ -1336,3 +1439,127 @@ elif page == "stock_updater":
                     st.success("✅ Done — new date column appended with formulas.")
                 except Exception as e:
                     st.error(f"❌ {e}")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE 3 — PETTY CASH AUTOMATION
+# ══════════════════════════════════════════════════════════════════════════════
+elif page == "petty_cash":
+    st.title("💰 Petty Cash Automation")
+    st.caption("Upload one or more Petty Cash Excel files — Journal sheets are filled automatically.")
+    st.divider()
+
+    pc_files = st.file_uploader(
+        "Upload Petty Cash Excel file(s)",
+        type=["xlsx"],
+        accept_multiple_files=True,
+        help="Each file must have a **Summary** sheet (with 'Current claim' section) and a **Journal** sheet.",
+        key="pc_upload",
+    )
+
+    if not pc_files:
+        st.info("Upload one or more Petty Cash Excel files to get started.")
+    else:
+        st.markdown(f"**{len(pc_files)} file(s) ready to process.**")
+
+        # Preview each file
+        for f in pc_files:
+            with st.expander(f"📄 {f.name}", expanded=True):
+                try:
+                    f.seek(0)
+                    file_bytes = f.read(); f.seek(0)
+                    wb_prev = openpyxl.load_workbook(io.BytesIO(file_bytes), read_only=True, data_only=True)
+
+                    if "Summary" not in wb_prev.sheetnames:
+                        st.error("❌ No 'Summary' sheet found."); wb_prev.close(); continue
+                    if "Journal" not in wb_prev.sheetnames:
+                        st.warning("⚠️ No 'Journal' sheet found — it will be skipped."); wb_prev.close(); continue
+
+                    ws_prev = wb_prev["Summary"]
+                    try:
+                        claim_start = pc_find_claim_start(ws_prev)
+                        items_prev  = pc_collect_items(ws_prev, claim_start)
+                    except ValueError as e:
+                        st.error(f"❌ {e}"); wb_prev.close(); continue
+
+                    wb_prev.close()
+
+                    if not items_prev:
+                        st.warning("No claim items found in this file.")
+                        continue
+
+                    st.success(f"✅ {len(items_prev)} claim item(s) found")
+
+                    # Show items as a clean table
+                    rows = []
+                    for row_num, desc, credit in items_prev:
+                        qty, unit = pc_parse_qty_unit(desc)
+                        rows.append({
+                            "Description": desc,
+                            "Amount (IDR)": credit,
+                            "Qty": qty if qty else "",
+                            "Unit": unit if unit else "",
+                        })
+                    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+                except Exception as e:
+                    st.error(f"❌ Could not read file: {e}")
+
+        st.divider()
+
+        if st.button("⚙️ Process & Download All Files", type="primary", use_container_width=True):
+            results = []   # (filename, bytes) for successful files
+            errors  = []
+
+            with st.spinner(f"Processing {len(pc_files)} file(s)…"):
+                for f in pc_files:
+                    try:
+                        f.seek(0)
+                        out_bytes, n_items = pc_process_file(f.read(), f.name)
+                        results.append((f.name, out_bytes, n_items))
+                    except Exception as e:
+                        errors.append((f.name, str(e)))
+
+            if errors:
+                for fname, err in errors:
+                    st.error(f"❌ {fname}: {err}")
+
+            if results:
+                st.success(f"✅ {len(results)} file(s) processed successfully.")
+
+                if len(results) == 1:
+                    fname, out_bytes, n_items = results[0]
+                    st.download_button(
+                        f"⬇️ Download {fname}",
+                        data=out_bytes,
+                        file_name=fname,
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True, type="primary",
+                    )
+                    st.caption(f"{n_items} item(s) written to Journal sheet.")
+                else:
+                    # Multiple files — zip them
+                    import zipfile
+                    zip_buf = io.BytesIO()
+                    with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                        for fname, out_bytes, _ in results:
+                            zf.writestr(fname, out_bytes)
+                    zip_buf.seek(0)
+
+                    today_label = date.today().strftime("%d-%b-%Y")
+                    zip_name = f"Petty_Cash_Processed_{today_label}.zip"
+                    st.download_button(
+                        f"⬇️ Download all {len(results)} files as ZIP",
+                        data=zip_buf.getvalue(),
+                        file_name=zip_name,
+                        mime="application/zip",
+                        use_container_width=True, type="primary",
+                    )
+                    st.markdown("**Individual downloads:**")
+                    for fname, out_bytes, n_items in results:
+                        st.download_button(
+                            f"⬇️ {fname}  ({n_items} items)",
+                            data=out_bytes,
+                            file_name=fname,
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            use_container_width=True,
+                        )
