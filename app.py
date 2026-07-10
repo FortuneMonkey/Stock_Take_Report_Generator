@@ -16,7 +16,7 @@ from reportlab.lib.units import cm
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 from reportlab.lib.enums import TA_RIGHT, TA_CENTER
 
-st.set_page_config(page_title="APRIL R&D Admin Suite", page_icon="📦", layout="wide")
+st.set_page_config(page_title="APRIL R&D Admin Automation", page_icon="📦", layout="wide")
 st.markdown("""
 <style>
 /* ── Global ────────────────────────────────────────────── */
@@ -799,27 +799,36 @@ def generate_updated_stock_report(trans_df, stock_file):
     prev_start_col = max_col - 3   # start of previous 4-col group (e.g. col 17 = Q)
     new_start = max_col + 1        # first column of new group (e.g. col 21 = U)
 
-    # ── Row 1: date header cell ──────────────────────────────────────────────
+    # ── Row 1: date header — apply fill+style to ALL 4 new columns ─────────
+    from openpyxl.styles import Alignment as OxlAlignment
+    src_r1 = ws.cell(row=1, column=prev_start_col)
     date_cell = ws.cell(row=1, column=new_start)
     date_cell.value = today_dt
-    src = ws.cell(row=1, column=prev_start_col)
-    if src.has_style:
-        date_cell.font        = copy.copy(src.font)
-        date_cell.fill        = copy.copy(src.fill)
-        date_cell.alignment   = copy.copy(src.alignment)
-        date_cell.border      = copy.copy(src.border)
-        date_cell.number_format = src.number_format   # "d-mmm-yy"
+    for i in range(4):
+        c = ws.cell(row=1, column=new_start + i)
+        if src_r1.has_style:
+            c.font          = copy.copy(src_r1.font)
+            c.fill          = copy.copy(src_r1.fill)
+            c.border        = copy.copy(src_r1.border)
+            c.number_format = src_r1.number_format
+        # Centre date across the merged span
+        c.alignment = OxlAlignment(horizontal='center', vertical='center',
+                                   wrap_text=src_r1.alignment.wrap_text if src_r1.has_style else False)
+    # Merge the 4 date header cells so it spans like existing periods
+    ws.merge_cells(start_row=1, start_column=new_start,
+                   end_row=1,   end_column=new_start + 3)
 
     # ── Row 2: sub-headers Balance / GR / GI / Balance ─────────────────────
     for i, label in enumerate(['Balance', 'GR', 'GI', 'Balance']):
-        cell = ws.cell(row=2, column=new_start+i)
+        cell = ws.cell(row=2, column=new_start + i)
         cell.value = label
-        src2 = ws.cell(row=2, column=prev_start_col+i)
+        src2 = ws.cell(row=2, column=prev_start_col + i)
         if src2.has_style:
             cell.font      = copy.copy(src2.font)
             cell.fill      = copy.copy(src2.fill)
             cell.alignment = copy.copy(src2.alignment)
             cell.border    = copy.copy(src2.border)
+            cell.number_format = src2.number_format
 
     # ── Column widths ────────────────────────────────────────────────────────
     for i in range(4):
@@ -854,8 +863,8 @@ def generate_updated_stock_report(trans_df, stock_file):
         existing_keys.add((mc_str, sec_str))
         last_data_row = row_idx
 
-        gr = int(grp.get((mc_str, sec_str, 'GR'), 0))
-        gi = int(grp.get((mc_str, sec_str, 'GI'), 0))
+        gr = round(grp.get((mc_str, sec_str, 'GR'), 0))
+        gi = round(grp.get((mc_str, sec_str, 'GI'), 0))
 
         values_and_formulas = [
             f"={prev_bal_letter}{row_idx}",
@@ -920,8 +929,8 @@ def generate_updated_stock_report(trans_df, stock_file):
             _copy_cell(last_data_row, col, row_idx, col, 0)
 
         # New period: Balance=0 (no prior stock), GR, GI, final Balance
-        gr = int(grp.get((mc_str, sec_str, 'GR'), 0))
-        gi = int(grp.get((mc_str, sec_str, 'GI'), 0))
+        gr = round(grp.get((mc_str, sec_str, 'GR'), 0))
+        gi = round(grp.get((mc_str, sec_str, 'GI'), 0))
         new_period = [
             0,      # Balance (new item — no previous balance)
             gr,
@@ -930,6 +939,208 @@ def generate_updated_stock_report(trans_df, stock_file):
         ]
         for i, val in enumerate(new_period):
             _copy_cell(last_data_row, prev_start_col+i, row_idx, new_start+i, val)
+
+    # ── Section tabs ─────────────────────────────────────────────────────────
+    # Collect all rows (including new ones) into a dataframe for easy grouping
+    final_max_row = ws.max_row
+    final_max_col = ws.max_column
+
+    # Read the full updated main sheet into memory (values only — fast)
+    all_rows = []
+    header_row1 = [ws.cell(1, c).value for c in range(1, final_max_col + 1)]
+    header_row2 = [ws.cell(2, c).value for c in range(1, final_max_col + 1)]
+
+    for r in range(3, final_max_row + 1):
+        mc_v = ws.cell(r, 1).value
+        if mc_v is None:
+            continue
+        row_data = []
+        for c in range(1, final_max_col + 1):
+            row_data.append(ws.cell(r, c).value)
+        all_rows.append(row_data)
+
+    # Group rows by Section (col 4, index 3)
+    from collections import defaultdict
+    section_rows = defaultdict(list)
+    for row_data in all_rows:
+        sec = str(row_data[3]).strip() if row_data[3] is not None else "Unknown"
+        section_rows[sec].append(row_data)
+
+    # Collect style templates from main sheet (row 2 headers + one data row)
+    def _get_col_styles(ws_src, ref_data_row=3):
+        """Return list of (font, fill, alignment, border, number_format) per column."""
+        styles = []
+        for c in range(1, final_max_col + 1):
+            cell = ws_src.cell(ref_data_row, c)
+            styles.append({
+                'font':          copy.copy(cell.font)          if cell.has_style else None,
+                'fill':          copy.copy(cell.fill)          if cell.has_style else None,
+                'alignment':     copy.copy(cell.alignment)     if cell.has_style else None,
+                'border':        copy.copy(cell.border)        if cell.has_style else None,
+                'number_format': cell.number_format            if cell.has_style else 'General',
+            })
+        return styles
+
+    data_styles  = _get_col_styles(ws, ref_data_row=3)
+    hdr1_styles  = [{'font': copy.copy(ws.cell(1, c).font),
+                     'fill': copy.copy(ws.cell(1, c).fill),
+                     'alignment': copy.copy(ws.cell(1, c).alignment),
+                     'border': copy.copy(ws.cell(1, c).border),
+                     'number_format': ws.cell(1, c).number_format}
+                    for c in range(1, final_max_col + 1)]
+    hdr2_styles  = [{'font': copy.copy(ws.cell(2, c).font),
+                     'fill': copy.copy(ws.cell(2, c).fill),
+                     'alignment': copy.copy(ws.cell(2, c).alignment),
+                     'border': copy.copy(ws.cell(2, c).border),
+                     'number_format': ws.cell(2, c).number_format}
+                    for c in range(1, final_max_col + 1)]
+
+    col_widths = {c: ws.column_dimensions[get_column_letter(c)].width
+                  for c in range(1, final_max_col + 1)}
+
+    def _apply_style(cell, style_dict):
+        if style_dict['font']:          cell.font          = copy.copy(style_dict['font'])
+        if style_dict['fill']:          cell.fill          = copy.copy(style_dict['fill'])
+        if style_dict['alignment']:     cell.alignment     = copy.copy(style_dict['alignment'])
+        if style_dict['border']:        cell.border        = copy.copy(style_dict['border'])
+        if style_dict['number_format']: cell.number_format = style_dict['number_format']
+
+    def _int(v):
+        return int(v) if isinstance(v, (int, float)) else 0
+
+    from openpyxl.utils import column_index_from_string
+    _cell_ref_re = re.compile(r'([A-Z]+)(\d+)')
+
+    def _resolve_row_formulas(row_data):
+        """Resolve simple formula strings (e.g. '=U5' or '=U5+V5-W5') stored
+        in the main sheet into actual numeric values, using values already
+        resolved earlier in the same row. The formulas this app writes only
+        ever reference earlier columns of the same row (previous period's
+        Balance/Final Balance), so a single left-to-right pass is enough.
+        Without this, re-updating an already-updated file wipes/zeroes every
+        prior period's Balance columns because their cell values are stored
+        as formula strings, not numbers."""
+        resolved = {}
+        for idx, raw in enumerate(row_data, start=1):
+            if isinstance(raw, str) and raw.startswith('='):
+                expr = raw[1:]
+                def _repl(m):
+                    col_idx = column_index_from_string(m.group(1))
+                    return str(resolved.get(col_idx, 0))
+                expr = _cell_ref_re.sub(_repl, expr)
+                try:
+                    resolved[idx] = eval(expr, {"__builtins__": {}})
+                except Exception:
+                    resolved[idx] = 0
+            else:
+                resolved[idx] = raw
+        return resolved
+
+    def _write_section_sheet(wb, sheet_name, rows):
+        from openpyxl.styles import Alignment as OxlAlignment
+        safe_name = sheet_name[:31]
+        if safe_name in wb.sheetnames:
+            del wb[safe_name]
+        ws_sec = wb.create_sheet(title=safe_name)
+
+        # ── Row 1: copy per-period date headers — fill ALL 4 cols per group + merge
+        # Replicate every merge group from main sheet row 1 into section sheet
+        main_merges_row1 = [
+            m for m in ws.merged_cells.ranges if m.min_row == 1 and m.max_row == 1
+        ]
+        for m in main_merges_row1:
+            # Apply fill/style to all cols in this merge group
+            src_r1 = ws.cell(1, m.min_col)
+            for c_idx in range(m.min_col, m.max_col + 1):
+                c = ws_sec.cell(1, c_idx)
+                if c_idx == m.min_col:
+                    c.value = src_r1.value  # date value only on first cell
+                if src_r1.has_style:
+                    c.font          = copy.copy(src_r1.font)
+                    c.fill          = copy.copy(src_r1.fill)
+                    c.border        = copy.copy(src_r1.border)
+                    c.number_format = src_r1.number_format
+                    # Centre the date horizontally
+                    c.alignment = OxlAlignment(horizontal='center', vertical='center',
+                                               wrap_text=src_r1.alignment.wrap_text)
+            ws_sec.merge_cells(start_row=1, start_column=m.min_col,
+                               end_row=1,   end_column=m.max_col)
+
+        # For any non-merged row-1 cols (static header cols), copy as-is
+        merged_cols_r1 = {c for m in main_merges_row1 for c in range(m.min_col, m.max_col+1)}
+        for c_idx in range(1, final_max_col + 4):
+            if c_idx not in merged_cols_r1:
+                c = ws_sec.cell(1, c_idx)
+                src = ws.cell(1, c_idx)
+                c.value = src.value
+                if src.has_style:
+                    c.font = copy.copy(src.font)
+                    c.fill = copy.copy(src.fill)
+                    c.alignment = copy.copy(src.alignment)
+                    c.border = copy.copy(src.border)
+                    c.number_format = src.number_format
+
+        # ── Row 2: sub-headers — copy style + value from main sheet
+        for c_idx in range(1, final_max_col + 4):
+            c2 = ws_sec.cell(2, c_idx)
+            src2 = ws.cell(2, c_idx)
+            c2.value = src2.value
+            if src2.has_style:
+                c2.font      = copy.copy(src2.font)
+                c2.fill      = copy.copy(src2.fill)
+                c2.alignment = copy.copy(src2.alignment)
+                c2.border    = copy.copy(src2.border)
+                c2.number_format = src2.number_format
+
+        # Data rows: row_data has cols 1..max_col (0-based index 0..max_col-1)
+        # New period cols (new_start..new_start+3) must be computed here since
+        # they don't exist in row_data (main sheet stores them as formulas)
+        for r_idx, row_data in enumerate(rows, start=3):
+            mc_str  = str(row_data[0]).strip()
+            sec_str = str(row_data[3]).strip() if row_data[3] else ''
+            resolved_row = _resolve_row_formulas(row_data)
+            prev_bal = _int(resolved_row.get(prev_bal_col, 0))  # last col = prev balance
+            gr = int(grp.get((mc_str, sec_str, 'GR'), 0))
+            gi = int(grp.get((mc_str, sec_str, 'GI'), 0))
+            new_bal = prev_bal + gr - gi
+
+            for c_idx in range(1, final_max_col + 1):
+                val = resolved_row.get(c_idx)
+                cell = ws_sec.cell(r_idx, c_idx)
+                cell.value = val
+                src_c = ws.cell(3, c_idx)  # style ref from first data row of main
+                if src_c.has_style:
+                    cell.font = copy.copy(src_c.font)
+                    cell.fill = copy.copy(src_c.fill)
+                    cell.alignment = copy.copy(src_c.alignment)
+                    cell.border = copy.copy(src_c.border)
+                    cell.number_format = src_c.number_format
+
+            # New period cols: Balance, GR, GI, New Balance
+            for c_idx, val in enumerate([prev_bal, gr, gi, new_bal], start=new_start):
+                cell = ws_sec.cell(r_idx, c_idx)
+                cell.value = val
+                src_c = ws.cell(3, c_idx)
+                if src_c.has_style:
+                    cell.font = copy.copy(src_c.font)
+                    cell.fill = copy.copy(src_c.fill)
+                    cell.alignment = copy.copy(src_c.alignment)
+                    cell.border = copy.copy(src_c.border)
+                    cell.number_format = src_c.number_format
+
+        # Column widths
+        for c_idx in range(1, final_max_col + 5):
+            ws_sec.column_dimensions[get_column_letter(c_idx)].width =                 ws.column_dimensions[get_column_letter(c_idx)].width
+
+        return ws_sec
+
+    # Normalise section keys (e.g. "adM" -> "ADM") so they merge into one tab
+    normalised = defaultdict(list)
+    for sec_name, rows in section_rows.items():
+        normalised[sec_name.strip().upper()].extend(rows)
+
+    for sec_name in sorted(normalised.keys()):
+        _write_section_sheet(wb, sec_name, normalised[sec_name])
 
     buf = io.BytesIO(); wb.save(buf); buf.seek(0)
     return buf
@@ -1054,7 +1265,7 @@ with st.sidebar:
         "<span style='font-size:2.4rem'>📦</span><br>"
         "<span style='font-weight:800;color:#1F4E79;font-size:1rem'>APRIL Fiber R&D</span><br>"
         "<span style='font-size:.72rem;color:#888;letter-spacing:.06em;text-transform:uppercase'>"
-        "Admin Automation Suite</span></div>",
+        "Admin Automation Portal</span></div>",
         unsafe_allow_html=True,
     )
     st.divider()
@@ -1075,23 +1286,6 @@ with st.sidebar:
     total_loaded = len([s for s in STORE_DEFS if s["key"] in st.session_state.stores_results])
     total_nm     = len([n for n in NM_DEFS    if n["sloc"] in st.session_state.nm_results])
     ok_col, bad_col = "#198754", "#dc3545"
-    st.markdown(
-        f"<div style='font-size:.8rem;color:#444;line-height:2'>"
-        f"<b>Upload Status</b><br>"
-        f"Store files &nbsp;"
-        f"<b style='color:{ok_col if total_loaded==7 else bad_col}'>{total_loaded}/7</b><br>"
-        f"NM files &nbsp;&nbsp;&nbsp;&nbsp;"
-        f"<b style='color:{ok_col if total_nm==2 else bad_col}'>{total_nm}/2</b><br>"
-        f"Quarter &nbsp;<b>{cfg.get('quarter','—')}</b> &nbsp;·&nbsp; "
-        f"Year &nbsp;<b>{cfg.get('year','—')}</b>"
-        f"</div>",
-        unsafe_allow_html=True,
-    )
-    st.markdown(
-        "<div style='text-align:center;font-size:.68rem;color:#bbb;margin-top:2rem'>"
-        "v2.0 · APRIL Fiber R&D</div>",
-        unsafe_allow_html=True,
-    )
 
 page = st.session_state.page
 
@@ -1420,7 +1614,9 @@ elif page == "stock_updater":
         today_label = date.today().strftime("%d-%b-%Y")
         st.info(
             f"A new column group **{today_label}** (Balance · GR · GI · New Balance) "
-            "will be appended to the stock report."
+            "will be appended to the stock report. "
+            "📑 A separate tab will also be created for each section so every department "
+            "can view their data directly without filtering."
         )
         if st.button("🔄 Generate Updated Stock Report", type="primary", use_container_width=True):
             with st.spinner("Processing…"):
@@ -1445,7 +1641,7 @@ elif page == "stock_updater":
 # ══════════════════════════════════════════════════════════════════════════════
 elif page == "petty_cash":
     st.title("💰 Petty Cash Automation")
-    st.caption("Upload one or more Petty Cash Excel files — Journal sheets are filled automatically.")
+    st.caption("Upload one or more Petty Cash Excel files to run automation.")
     st.divider()
 
     pc_files = st.file_uploader(
