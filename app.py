@@ -728,7 +728,9 @@ def generate_pdf(cfg, stores_results):
 def extract_section_from_ref(ref):
     if not ref or str(ref).strip() in ('', 'nan'): return ''
     ref = str(ref).strip()
-    if '/' in ref: return ref.split('/')[0].strip()
+    parts = re.split(r'[/\-]', ref, maxsplit=1)
+    if len(parts) > 1:
+        return parts[0].strip()
     return ' '.join(ref.split()[:3])
 
 def prepare_transaction_df(uploaded_file):
@@ -770,9 +772,9 @@ def cached_load_transaction(trans_bytes: bytes) -> pd.DataFrame:
         ref_col = next((c for c in df.columns if "reference" in str(c).lower()), None)
         if ref_col:
             refs = df[ref_col].astype(str).str.strip()
-            has_slash = refs.str.contains("/", regex=False)
-            df["Section"] = refs.where(~has_slash, refs.str.split("/").str[0].str.strip())
-            df.loc[~has_slash, "Section"] = refs[~has_slash].str.split().str[:3].str.join(" ")
+            has_delim = refs.str.contains(r'[/\-]', regex=True)
+            df["Section"] = refs.where(~has_delim, refs.str.split(r'[/\-]', n=1, regex=True).str[0].str.strip())
+            df.loc[~has_delim, "Section"] = refs[~has_delim].str.split().str[:3].str.join(" ")
     # Derive Code and Qty — vectorised
     if "Code" not in df.columns:
         qty_col = next((c for c in df.columns if str(c).lower() == "quantity"), None)
@@ -863,8 +865,8 @@ def generate_updated_stock_report(trans_df, stock_file):
         existing_keys.add((mc_str, sec_str))
         last_data_row = row_idx
 
-        gr = round(grp.get((mc_str, sec_str, 'GR'), 0))
-        gi = round(grp.get((mc_str, sec_str, 'GI'), 0))
+        gr = safe_float(grp.get((mc_str, sec_str, 'GR'), 0))
+        gi = safe_float(grp.get((mc_str, sec_str, 'GI'), 0))
 
         values_and_formulas = [
             f"={prev_bal_letter}{row_idx}",
@@ -929,8 +931,8 @@ def generate_updated_stock_report(trans_df, stock_file):
             _copy_cell(last_data_row, col, row_idx, col, 0)
 
         # New period: Balance=0 (no prior stock), GR, GI, final Balance
-        gr = round(grp.get((mc_str, sec_str, 'GR'), 0))
-        gi = round(grp.get((mc_str, sec_str, 'GI'), 0))
+        gr = safe_float(grp.get((mc_str, sec_str, 'GR'), 0))
+        gi = safe_float(grp.get((mc_str, sec_str, 'GI'), 0))
         new_period = [
             0,      # Balance (new item — no previous balance)
             gr,
@@ -1005,8 +1007,10 @@ def generate_updated_stock_report(trans_df, stock_file):
         if style_dict['border']:        cell.border        = copy.copy(style_dict['border'])
         if style_dict['number_format']: cell.number_format = style_dict['number_format']
 
-    def _int(v):
-        return int(v) if isinstance(v, (int, float)) else 0
+    def _num(v):
+        # Preserve decimals (previous version used int(), which truncated
+        # fractional balances to 0 and silently dropped anything < 1).
+        return float(v) if isinstance(v, (int, float)) else 0.0
 
     from openpyxl.utils import column_index_from_string
     _cell_ref_re = re.compile(r'([A-Z]+)(\d+)')
@@ -1099,9 +1103,9 @@ def generate_updated_stock_report(trans_df, stock_file):
             mc_str  = str(row_data[0]).strip()
             sec_str = str(row_data[3]).strip() if row_data[3] else ''
             resolved_row = _resolve_row_formulas(row_data)
-            prev_bal = _int(resolved_row.get(prev_bal_col, 0))  # last col = prev balance
-            gr = int(grp.get((mc_str, sec_str, 'GR'), 0))
-            gi = int(grp.get((mc_str, sec_str, 'GI'), 0))
+            prev_bal = _num(resolved_row.get(prev_bal_col, 0))  # last col = prev balance
+            gr = safe_float(grp.get((mc_str, sec_str, 'GR'), 0))
+            gi = safe_float(grp.get((mc_str, sec_str, 'GI'), 0))
             new_bal = prev_bal + gr - gi
 
             for c_idx in range(1, final_max_col + 1):
