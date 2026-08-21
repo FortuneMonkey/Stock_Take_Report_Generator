@@ -725,6 +725,14 @@ def generate_pdf(cfg, stores_results):
 # STOCK REPORT UPDATER
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _resolve_data_sheet_name(sheet_names, default=None):
+    """Return the sheet name that matches 'data' case-insensitively, or `default`
+    if no such sheet exists (so callers can fall back to the active/first sheet)."""
+    for name in sheet_names:
+        if str(name).strip().lower() == 'data':
+            return name
+    return default
+
 def extract_section_from_ref(ref):
     if not ref or str(ref).strip() in ('', 'nan'): return ''
     ref = str(ref).strip()
@@ -751,8 +759,11 @@ def cached_load_stock_keys(stock_bytes: bytes) -> set:
     """Return set of (MC, Section) tuples. Uses pandas — fast, no openpyxl row iteration."""
     # Row 1 = date headers, row 2 = column names → header=1 (0-indexed)
     # Only read columns A (MC=0) and D (Section=3) — skip everything else
+    xls = pd.ExcelFile(io.BytesIO(stock_bytes))
+    data_sheet = _resolve_data_sheet_name(xls.sheet_names, default=0)
     df = pd.read_excel(
-        io.BytesIO(stock_bytes),
+        xls,
+        sheet_name=data_sheet,
         header=1,          # row 2 in Excel is the real header
         usecols=[0, 3],    # col A = MC, col D = Section
         dtype=str,
@@ -760,7 +771,7 @@ def cached_load_stock_keys(stock_bytes: bytes) -> set:
     df.columns = ["MC", "Section"]
     df = df.dropna(subset=["MC"])
     return set(
-        zip(df["MC"].str.strip(), df["Section"].fillna("").str.strip())
+        zip(df["MC"].str.strip(), df["Section"].fillna("").str.strip().str.upper())
     )
 
 @st.cache_data(show_spinner=False)
@@ -793,7 +804,8 @@ def generate_updated_stock_report(trans_df, stock_file):
     from openpyxl.utils import get_column_letter
     from datetime import datetime as dt
     wb = openpyxl.load_workbook(stock_file)
-    ws = wb.active
+    data_sheet = _resolve_data_sheet_name(wb.sheetnames)
+    ws = wb[data_sheet] if data_sheet else wb.active
 
     today_dt = dt.combine(date.today(), dt.min.time())
     max_col = ws.max_column
@@ -839,7 +851,7 @@ def generate_updated_stock_report(trans_df, stock_file):
 
     # ── Build grouped lookup: (mat_str, sec_str, code) -> summed qty ─────────
     trans_df['_mat']  = trans_df['Material'].astype(str).str.strip()
-    trans_df['_sec']  = trans_df['Section'].astype(str).str.strip()
+    trans_df['_sec']  = trans_df['Section'].astype(str).str.strip().str.upper()
     trans_df['_code'] = trans_df['Code'].astype(str).str.strip()
     trans_df['_qty']  = trans_df['Quantity(RemoveNegative)'].fillna(0)
     grp = trans_df.groupby(['_mat','_sec','_code'])['_qty'].sum()
@@ -862,11 +874,12 @@ def generate_updated_stock_report(trans_df, stock_file):
 
         mc_str  = str(mc_val).strip()
         sec_str = str(sec_val).strip() if sec_val is not None else ''
-        existing_keys.add((mc_str, sec_str))
+        sec_key = sec_str.upper()
+        existing_keys.add((mc_str, sec_key))
         last_data_row = row_idx
 
-        gr = safe_float(grp.get((mc_str, sec_str, 'GR'), 0))
-        gi = safe_float(grp.get((mc_str, sec_str, 'GI'), 0))
+        gr = safe_float(grp.get((mc_str, sec_key, 'GR'), 0))
+        gi = safe_float(grp.get((mc_str, sec_key, 'GI'), 0))
 
         values_and_formulas = [
             f"={prev_bal_letter}{row_idx}",
@@ -1104,8 +1117,8 @@ def generate_updated_stock_report(trans_df, stock_file):
             sec_str = str(row_data[3]).strip() if row_data[3] else ''
             resolved_row = _resolve_row_formulas(row_data)
             prev_bal = _num(resolved_row.get(prev_bal_col, 0))  # last col = prev balance
-            gr = safe_float(grp.get((mc_str, sec_str, 'GR'), 0))
-            gi = safe_float(grp.get((mc_str, sec_str, 'GI'), 0))
+            gr = safe_float(grp.get((mc_str, sec_str.upper(), 'GR'), 0))
+            gi = safe_float(grp.get((mc_str, sec_str.upper(), 'GI'), 0))
             new_bal = prev_bal + gr - gi
 
             for c_idx in range(1, final_max_col + 1):
@@ -1565,7 +1578,7 @@ elif page == "stock_updater":
             # ── Vectorised new-item flag ──────────────────────────────────
             df_prev = df_prev.copy()
             df_prev["_mat"] = df_prev["Material"].astype(str).str.strip()
-            df_prev["_sec"] = df_prev["Section"].astype(str).str.strip()
+            df_prev["_sec"] = df_prev["Section"].astype(str).str.strip().str.upper()
             # pd.MultiIndex lookup — vectorised, no row-by-row apply
             idx = pd.MultiIndex.from_arrays([df_prev["_mat"], df_prev["_sec"]])
             df_prev["is_new"] = ~idx.isin(pd.MultiIndex.from_tuples(existing_keys))
