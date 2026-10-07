@@ -1,7 +1,7 @@
 import streamlit as st
 import openpyxl
 import pandas as pd
-import io, os, json, re, copy
+import io, os, json, re, copy, zipfile
 from datetime import datetime, date
 from docx import Document
 from docx.shared import Pt, RGBColor, Cm
@@ -15,6 +15,7 @@ from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib.units import cm
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 from reportlab.lib.enums import TA_RIGHT, TA_CENTER
+from PIL import Image, ImageSequence
 
 st.set_page_config(page_title="APRIL R&D Admin Automation", page_icon="📦", layout="wide")
 st.markdown("""
@@ -1263,6 +1264,54 @@ def pc_process_file(file_bytes: bytes, filename: str) -> bytes:
     return buf.getvalue(), len(items)
 
 # ══════════════════════════════════════════════════════════════════════════════
+# TIF → PDF CONVERTER
+# ══════════════════════════════════════════════════════════════════════════════
+Image.MAX_IMAGE_PIXELS = None   # scanned drawings can be very large
+
+def tif_prepare_frame(frame):
+    """Return an RGB / L / 1-bit copy of a TIFF frame that PDF can embed."""
+    if frame.mode in ("1", "L", "RGB"):
+        return frame.copy()
+    if frame.mode in ("RGBA", "LA", "PA"):
+        rgba = frame.convert("RGBA")
+        bg = Image.new("RGB", rgba.size, (255, 255, 255))
+        bg.paste(rgba, mask=rgba.split()[3])
+        return bg
+    if frame.mode in ("I;16", "I;16B", "I;16L", "I", "F"):
+        return frame.point(lambda x: x / 256).convert("L") if frame.mode.startswith("I;16") else frame.convert("L")
+    return frame.convert("RGB")          # P, CMYK, YCbCr, etc.
+
+def tif_save_pdf(pages, res=200.0, quality=85):
+    """Write PIL pages to PDF bytes. Pure 1-bit scans keep lossless CCITT (no quality arg)."""
+    buf = io.BytesIO()
+    if all(p.mode == "1" for p in pages):
+        pages[0].save(buf, format="PDF", save_all=True, append_images=pages[1:], resolution=res)
+    else:
+        pages = [p.convert("L") if p.mode == "1" else p for p in pages]
+        pages[0].save(buf, format="PDF", save_all=True, append_images=pages[1:],
+                      resolution=res, quality=quality)
+    return buf.getvalue()
+
+def tif_to_pdf_bytes(file_bytes: bytes, quality: int = 85, force_gray: bool = False):
+    """Convert a (multi-page) TIFF into one PDF. Returns (pdf_bytes, n_pages)."""
+    img = Image.open(io.BytesIO(file_bytes))
+    dpi = img.info.get("dpi", (200, 200))
+    try:    res = float(dpi[0])
+    except Exception: res = 200.0
+    if res < 50: res = 200.0
+
+    pages = []
+    for frame in ImageSequence.Iterator(img):
+        pg = tif_prepare_frame(frame)
+        if force_gray and pg.mode == "RGB":
+            pg = pg.convert("L")
+        pages.append(pg)
+    if not pages:
+        raise ValueError("No image data found in file.")
+
+    return tif_save_pdf(pages, res, quality), len(pages)
+
+# ══════════════════════════════════════════════════════════════════════════════
 # UI
 # ══════════════════════════════════════════════════════════════════════════════
 if "stores_results" not in st.session_state: st.session_state.stores_results = {}
@@ -1297,6 +1346,9 @@ with st.sidebar:
     if st.button("💰  Petty Cash", use_container_width=True,
                  type="primary" if p == "petty_cash" else "secondary", key="nav_pc"):
         st.session_state.page = "petty_cash"; st.rerun()
+    if st.button("🖼️  TIF Converter", use_container_width=True,
+                 type="primary" if p == "tif_converter" else "secondary", key="nav_tif"):
+        st.session_state.page = "tif_converter"; st.rerun()
 
     st.divider()
 
@@ -1776,3 +1828,91 @@ elif page == "petty_cash":
                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                             use_container_width=True,
                         )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE 4 — TIF CONVERTER
+# ══════════════════════════════════════════════════════════════════════════════
+elif page == "tif_converter":
+    st.title("🖼️ TIF Converter")
+    st.caption("Convert TIF / TIFF images (including multi-page scans) to PDF.")
+    st.divider()
+
+    tif_files = st.file_uploader(
+        "Upload TIF / TIFF file(s)",
+        type=["tif", "tiff"],
+        accept_multiple_files=True,
+        help="Multi-page TIFFs become multi-page PDFs.",
+        key="tif_upload",
+    )
+
+    with st.expander("⚙️ Options", expanded=False):
+        c1, c2 = st.columns(2)
+        with c1:
+            tif_quality = st.slider("Image quality (colour / greyscale)", 30, 100, 85,
+                                    help="Lower = smaller file. Black & white scans are unaffected.")
+        with c2:
+            tif_gray = st.checkbox("Convert colour pages to greyscale", value=False,
+                                   help="Smaller PDF if the scan doesn't need colour.")
+        tif_merge = st.checkbox("Merge all uploaded files into one PDF", value=False)
+
+    if not tif_files:
+        st.info("Upload one or more TIF files to get started.")
+    else:
+        st.markdown(f"**{len(tif_files)} file(s) ready to convert.**")
+        for f in tif_files:
+            try:
+                im = Image.open(io.BytesIO(f.getvalue()))
+                n = getattr(im, "n_frames", 1)
+                st.caption(f"📄 {f.name} — {im.size[0]}×{im.size[1]} px · {n} page(s) · mode {im.mode} · {round(len(f.getvalue())/1024):,} KB")
+            except Exception as e:
+                st.error(f"❌ {f.name}: cannot read file ({e})")
+
+        st.divider()
+        if st.button("🔄 Convert to PDF", type="primary", use_container_width=True, key="tif_convert_btn"):
+            results, errors = [], []
+            with st.spinner(f"Converting {len(tif_files)} file(s)…"):
+                if tif_merge:
+                    try:
+                        merged_pages = []
+                        for f in tif_files:
+                            im = Image.open(io.BytesIO(f.getvalue()))
+                            for fr in ImageSequence.Iterator(im):
+                                pg = tif_prepare_frame(fr)
+                                if tif_gray and pg.mode == "RGB": pg = pg.convert("L")
+                                merged_pages.append(pg)
+                        results.append((f"Merged_{date.today().strftime('%d-%b-%Y')}.pdf",
+                                        tif_save_pdf(merged_pages, 200.0, tif_quality), len(merged_pages)))
+                    except Exception as e:
+                        errors.append(("Merge", str(e)))
+                else:
+                    for f in tif_files:
+                        try:
+                            pdf, n = tif_to_pdf_bytes(f.getvalue(), tif_quality, tif_gray)
+                            results.append((os.path.splitext(f.name)[0] + ".pdf", pdf, n))
+                        except Exception as e:
+                            errors.append((f.name, str(e)))
+
+            for fname, err in errors:
+                st.error(f"❌ {fname}: {err}")
+
+            if results:
+                st.success(f"✅ {len(results)} PDF(s) created.")
+                if len(results) == 1:
+                    fname, pdf, n = results[0]
+                    st.download_button(f"⬇️ Download {fname}", data=pdf, file_name=fname,
+                                       mime="application/pdf", use_container_width=True, type="primary")
+                    st.caption(f"{n} page(s) · {round(len(pdf)/1024):,} KB")
+                else:
+                    zbuf = io.BytesIO()
+                    with zipfile.ZipFile(zbuf, "w", zipfile.ZIP_DEFLATED) as zf:
+                        for fname, pdf, _ in results:
+                            zf.writestr(fname, pdf)
+                    st.download_button(
+                        f"⬇️ Download all {len(results)} PDFs as ZIP", data=zbuf.getvalue(),
+                        file_name=f"TIF_to_PDF_{date.today().strftime('%d-%b-%Y')}.zip",
+                        mime="application/zip", use_container_width=True, type="primary")
+                    st.markdown("**Individual downloads:**")
+                    for i, (fname, pdf, n) in enumerate(results):
+                        st.download_button(f"⬇️ {fname}  ({n} pages)", data=pdf, file_name=fname,
+                                           mime="application/pdf", use_container_width=True, key=f"tif_dl_{i}")
